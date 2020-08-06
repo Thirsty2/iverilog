@@ -15,14 +15,10 @@ RUN apt-get -y update && \
 
 ENV IVERILOG_BRANCH=master
 
-RUN git clone --branch=${IVERILOG_BRANCH} https://github.com/steveicarus/iverilog && \
-    cd iverilog && \
-    bash autoconf.sh && \
+RUN bash autoconf.sh && \
     ./configure && \
     make && \
-    make install && \
-    cd && \
-    rm -rf iverilog
+    make install
 
 FROM ubuntu:18.04
 
