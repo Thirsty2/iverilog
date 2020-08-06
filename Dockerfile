@@ -13,10 +13,7 @@ RUN apt-get -y update && \
         gperf && \
     rm -rf /var/lib/apt/lists/*
 
-ARG GITHUB_WORKSPACE
-
-RUN bash cd $GITHUB_WORKSPACE && \
-    autoconf.sh && \
+RUN bash autoconf.sh && \
     ./configure && \
     make && \
     make install
