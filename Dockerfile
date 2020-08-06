@@ -13,7 +13,7 @@ RUN apt-get -y update && \
         gperf && \
     rm -rf /var/lib/apt/lists/*
 
-ARG IVERILOG_BRANCH=master
+ARG GITHUB_WORKSPACE
 
 RUN bash cd ${GITHUB_WORKSPACE} && \
     autoconf.sh && \
