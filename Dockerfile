@@ -13,9 +13,9 @@ RUN apt-get -y update && \
         gperf && \
     rm -rf /var/lib/apt/lists/*
 
-ENV IVERILOG_VERSION=v10_3
+ENV IVERILOG_BRANCH=master
 
-RUN git clone --branch=${IVERILOG_VERSION} https://github.com/steveicarus/iverilog && \
+RUN git clone --branch=${IVERILOG_BRANCH} https://github.com/steveicarus/iverilog && \
     cd iverilog && \
     bash autoconf.sh && \
     ./configure && \
@@ -35,7 +35,7 @@ RUN apt-get -y update && \
 
 COPY --from=builder /usr/local /usr/local/
 
-WORKDIR /root/iv
+WORKDIR /home/ic
 ENTRYPOINT [ "make" ]
 
 
