@@ -13,7 +13,9 @@ RUN apt-get -y update && \
         gperf && \
     rm -rf /var/lib/apt/lists/*
 
-RUN bash autoconf.sh && \
+COPY . .
+
+RUN bash ./autoconf.sh && \
     ./configure && \
     make && \
     make install
