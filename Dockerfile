@@ -15,7 +15,7 @@ RUN apt-get -y update && \
 
 ARG GITHUB_WORKSPACE
 
-RUN bash cd ${GITHUB_WORKSPACE} && \
+RUN bash cd $GITHUB_WORKSPACE && \
     autoconf.sh && \
     ./configure && \
     make && \
