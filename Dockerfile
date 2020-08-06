@@ -13,9 +13,10 @@ RUN apt-get -y update && \
         gperf && \
     rm -rf /var/lib/apt/lists/*
 
-ENV IVERILOG_BRANCH=master
+ARG IVERILOG_BRANCH=master
 
-RUN bash autoconf.sh && \
+RUN bash cd ${GITHUB_WORKSPACE} && \
+    autoconf.sh && \
     ./configure && \
     make && \
     make install
