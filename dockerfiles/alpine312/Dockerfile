@@ -1,9 +1,27 @@
-FROM alpine:3.12 as builder
+ARG IMAGE="alpine:3.12"
+# Note that some commands such as 'apk add' won't work in arbitrary images.  For instance,
+# 'apk add' works fine under alpine, but not under Ubuntu (at least not by default.)
+
+FROM $IMAGE as base
 
 # The following will be cached by the docker layer caching mechanism the first time this
 # dockerfile is built, and these commands will never execute again unless you force them
 # to with the --no-cache option:
 # docker build --no-cache . -t iverilog:latest
+RUN apk add --no-cache \
+        bzip2 \
+        libbz2 \
+        libgcc \
+        libhistory \
+        libstdc++ \
+        make \
+        readline \
+        zlib
+
+FROM base as builder 
+
+ARG IVERILOG_REPO_URL=https://github.com/steveicarus/iverilog
+
 RUN apk add --no-cache \
 	autoconf \
 	build-base \
@@ -18,7 +36,7 @@ RUN apk add --no-cache \
 # This clone command results in a bare repo that will remain at the state it
 # is at when this Dockerfile is first built and cached by docker. 
 # This leverages the caching to avoid repeated full clones, saving bandwidth.
-RUN git clone --mirror https://github.com/steveicarus/iverilog iverilog.git
+RUN git clone --mirror ${IVERILOG_REPO_URL} iverilog.git
 
 # Bust the cache here or the following 'git remote update' will not execute.
 # Pass a random value to the BUST_THE_CAST ENV declared below for 
@@ -43,21 +61,14 @@ RUN git clone --branch=${IVERILOG_BRANCH} iverilog.git iverilog && \
     sh autoconf.sh && \
     ./configure && \
     make -j4 && \
-    make install && \
-    cd && \
-    rm -rf iverilog
+    make install
 
-FROM alpine:3.12
+FROM builder as test-builder
 
-RUN apk add --no-cache \
-        bzip2 \
-        libbz2 \
-        libgcc \
-        libhistory \
-        libstdc++ \
-        make \
-        readline \
-        zlib
+WORKDIR /iverilog
+RUN make check
+
+FROM base as release-candidate
 
 COPY --from=builder /usr/local /usr/local/
 
@@ -65,4 +76,14 @@ RUN adduser --disabled-password ic
 USER ic
 WORKDIR /home/ic
 
+FROM release-candidate as release-candidate-entrypoint-make
+
 ENTRYPOINT [ "make" ]
+
+FROM release-candidate-entrypoint-make as test-release-candidate-entrypoint-make
+COPY --from=builder /iverilog/dockerfiles/test /home/ic/
+
+RUN make
+RUN make clean
+
+FROM release-candidate-entrypoint-make as release-entrypoint-make
