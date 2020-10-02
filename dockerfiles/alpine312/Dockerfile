@@ -20,7 +20,7 @@ RUN apk add --no-cache \
 
 FROM base as builder 
 
-ARG IVERILOG_REPO_URL=https://github.com/steveicarus/iverilog
+ARG IVERILOG_REPO_URL=https://github.com/steveicarus/iverilog.git
 
 RUN apk add --no-cache \
 	autoconf \
@@ -80,10 +80,31 @@ FROM release-candidate as release-candidate-entrypoint-make
 
 ENTRYPOINT [ "make" ]
 
+# The make and make clean lines below fail if iverilog/dockerfiles/test isn't available
+# and older release branches like v10_3 do not have this directory, so we need a
+# layer that does have it to copy from.  We create that layer as test-branch here:
+FROM builder as test-branch
+WORKDIR /iverilog
+ARG TEST_BRANCH=master
+RUN git checkout ${TEST_BRANCH}
+
 FROM release-candidate-entrypoint-make as test-release-candidate-entrypoint-make
-COPY --from=builder /iverilog/dockerfiles/test /home/ic/
+COPY --from=test-branch /iverilog/dockerfiles/test /home/ic/
 
 RUN make
 RUN make clean
 
-FROM release-candidate-entrypoint-make as release-entrypoint-make
+FROM release-candidate-entrypoint-make as iverilog-make
+
+FROM release-candidate as iverilog
+
+# Below are some sample commands to build docker images.
+# 
+# The following builds the v10_3 tag from the Thirsty2/iverilog fork 
+# docker build --build-arg IVERILOG_REPO_URL=https://github.com/Thirsty2/iverilog.git --build-arg IVERILOG_BRANCH=v10_3 --build-arg TEST_BRANCH=add-dockerfile . -t iverilog:10.3
+#
+# The following builds the latest code from the Thirsty2/iverilog fork master branch
+# docker build --build-arg IVERILOG_REPO_URL=https://github.com/Thirsty2/iverilog.git --build-arg TEST_BRANCH=add-dockerfile . -t iverilog
+#
+# The following won't work until the pull request is accepted, but should work afterwards to build the master branch of steveicarus/iverilog
+# docker build . -t iverilog
