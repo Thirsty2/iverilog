@@ -936,12 +936,14 @@ static int show_stmt_assign_darray_pattern(ivl_statement_t net)
       ivl_lval_t lval = ivl_stmt_lval(net, 0);
       ivl_expr_t rval = ivl_stmt_rval(net);
 
-      ivl_signal_t var= ivl_lval_sig(lval);
+      ivl_signal_t var = ivl_lval_sig(lval);
       ivl_type_t var_type= ivl_signal_net_type(var);
       assert(ivl_type_base(var_type) == IVL_VT_DARRAY);
 
       ivl_type_t element_type = ivl_type_element(var_type);
       unsigned idx;
+      unsigned size_reg = allocate_word();
+
 #if 0
       unsigned element_width = 1;
       if (ivl_type_base(element_type) == IVL_VT_BOOL)
@@ -949,6 +951,16 @@ static int show_stmt_assign_darray_pattern(ivl_statement_t net)
       else if (ivl_type_base(element_type) == IVL_VT_LOGIC)
 	    element_width = width_of_packed_type(element_type);
 #endif
+
+// FIXME: At the moment we reallocate the array space.
+//        This probably should be a resize to avoid values glitching
+	/* Allocate at least enough space for the array patter. */
+      fprintf(vvp_out, "    %%ix/load %u, %u, 0;\n", size_reg, ivl_expr_parms(rval));
+	/* This can not have have a X/Z value so clear flag 4. */
+      fprintf(vvp_out, "    %%flag_set/imm 4, 0;\n");
+      darray_new(element_type, size_reg);
+      fprintf(vvp_out, "    %%store/obj v%p_0;\n", var);
+
       assert(ivl_expr_type(rval) == IVL_EX_ARRAY_PATTERN);
       for (idx = 0 ; idx < ivl_expr_parms(rval) ; idx += 1) {
 	    switch (ivl_type_base(element_type)) {
@@ -998,34 +1010,26 @@ static int show_stmt_assign_sig_darray(ivl_statement_t net)
       assert(ivl_stmt_opcode(net) == 0);
       assert(part == 0);
 
-      if (mux && (ivl_type_base(element_type)==IVL_VT_REAL)) {
+      if (mux && (ivl_type_base(element_type) == IVL_VT_REAL)) {
 	    draw_eval_real(rval);
-
-	      /* The %set/dar expects the array index to be in index
+	      /* The %store/dar/r expects the array index to be in index
 		 register 3. Calculate the index in place. */
 	    draw_eval_expr_into_integer(mux, 3);
-
 	    fprintf(vvp_out, "    %%store/dar/r v%p_0;\n", var);
 
-      } else if (mux && ivl_type_base(element_type)==IVL_VT_STRING) {
-
-	      /* Evaluate the rval into the top of the string stack. */
+      } else if (mux && ivl_type_base(element_type) == IVL_VT_STRING) {
 	    draw_eval_string(rval);
-
-	      /* The %store/dar/s expects the array index to me in index
+	      /* The %store/dar/str expects the array index to me in index
 		 register 3. Calculate the index in place. */
 	    draw_eval_expr_into_integer(mux, 3);
-
 	    fprintf(vvp_out, "    %%store/dar/str v%p_0;\n", var);
 
       } else if (mux) {
 	    draw_eval_vec4(rval);
 	    resize_vec4_wid(rval, ivl_stmt_lwidth(net));
-
 	      /* The %store/dar/vec4 expects the array index to be in index
 		 register 3. Calculate the index in place. */
 	    draw_eval_expr_into_integer(mux, 3);
-
 	    fprintf(vvp_out, "    %%store/dar/vec4 v%p_0;\n", var);
 
       } else if (ivl_expr_type(rval) == IVL_EX_ARRAY_PATTERN) {
@@ -1061,9 +1065,10 @@ static int show_stmt_assign_queue_pattern(ivl_signal_t var, ivl_expr_t rval,
       max_size = ivl_signal_array_count(var);
       max_elems = ivl_expr_parms(rval);
       if ((max_size != 0) && (max_elems > max_size)) {
-	    fprintf(stderr, "Warning: Array pattern assignment has more elements "
+	    fprintf(stderr, "%s:%u: Warning: Array pattern assignment has more elements "
 	                    "(%u) than bounded queue '%s' supports (%u).\n"
 	                    "         Only using first %u elements.\n",
+	                    ivl_expr_file(rval), ivl_expr_lineno(rval),
 	                    max_elems, ivl_signal_basename(var), max_size, max_size);
 	    max_elems = max_size;
       }
@@ -1073,7 +1078,7 @@ static int show_stmt_assign_queue_pattern(ivl_signal_t var, ivl_expr_t rval,
 		case IVL_VT_LOGIC:
 		  draw_eval_vec4(ivl_expr_parm(rval,idx));
 		  fprintf(vvp_out, "    %%ix/load 3, %u, 0;\n", idx);
-		  fprintf(vvp_out, "    %%store/qdar/vec4 v%p_0, %d, %u;\n", var, max_idx,
+		  fprintf(vvp_out, "    %%store/qdar/v v%p_0, %d, %u;\n", var, max_idx,
 		                   width_of_packed_type(element_type));
 		  break;
 
@@ -1135,51 +1140,56 @@ static int show_stmt_assign_sig_queue(ivl_statement_t net)
       if (ivl_expr_type(rval) == IVL_EX_NULL) {
 	    errors += draw_eval_object(rval);
 	    fprintf(vvp_out, "    %%store/obj v%p_0;\n", var);
-      } else if  (mux && (ivl_type_base(element_type)==IVL_VT_REAL)) {
+
+      } else if  (mux && (ivl_type_base(element_type) == IVL_VT_REAL)) {
 	    draw_eval_real(rval);
-	      /* The %store/dar expects the array index to be in
+	      /* The %store/qdar expects the array index to be in
 		 index register 3. */
 	    draw_eval_expr_into_integer(mux, 3);
 	    fprintf(vvp_out, "    %%store/qdar/r v%p_0, %d;\n", var, idx);
-      } else if (mux && ivl_type_base(element_type)==IVL_VT_STRING) {
+
+      } else if (mux && ivl_type_base(element_type) == IVL_VT_STRING) {
 	    draw_eval_string(rval);
-	      /* The %store/dar expects the array index to be in
+	      /* The %store/qdar expects the array index to be in
 		 index register 3. */
 	    draw_eval_expr_into_integer(mux, 3);
 	    fprintf(vvp_out, "    %%store/qdar/str v%p_0, %d;\n", var, idx);
+
       } else if (mux) { // What is left must be some form of vector
+	    assert(ivl_type_base(element_type) == IVL_VT_BOOL ||
+                   ivl_type_base(element_type) == IVL_VT_LOGIC);
 	    draw_eval_vec4(rval);
 	    resize_vec4_wid(rval, ivl_stmt_lwidth(net));
-	      /* The %store/dar expects the array index to be in
+	      /* The %store/qdar expects the array index to be in
 		 index register 3. */
 	    draw_eval_expr_into_integer(mux, 3);
-	    fprintf(vvp_out, "    %%store/qdar/vec4 v%p_0, %d, %u;\n", var, idx,
+	    fprintf(vvp_out, "    %%store/qdar/v v%p_0, %d, %u;\n", var, idx,
 	                     width_of_packed_type(element_type));
+
       } else if (ivl_expr_type(rval) == IVL_EX_ARRAY_PATTERN) {
 	      /* There is no l-value mux, but the r-value is an array
 		 pattern. This is a special case of an assignment to
-		 elements of the l-value. */
+		 the l-value. */
 	    errors += show_stmt_assign_queue_pattern(var, rval, element_type, idx);
-      } else {
-	    fprintf(stderr, "Sorry: I don't know how to handle expr_type=%d "
-	                    "being assigned to a queue.\n", ivl_expr_type(rval));
-	    fprintf(vvp_out, "  ; Sorry: Queues do not currently handle "
-	                     "expr_type=%d.\n", ivl_expr_type(rval));
-	    errors += 1;
-      }
-      clr_word(idx);
-// FIXME: This is probably needed to assign from an actual array.
-#if 0
-static int show_stmt_assign_sig_darray(ivl_statement_t net)
-{
+
       } else {
 	      /* There is no l-value mux, so this must be an
 		 assignment to the array as a whole. Evaluate the
 		 "object", and store the evaluated result. */
 	    errors += draw_eval_object(rval);
-	    fprintf(vvp_out, "    %%store/obj v%p_0;\n", var);
+	    if (ivl_type_base(element_type) == IVL_VT_REAL)
+		  fprintf(vvp_out, "    %%store/qobj/r v%p_0, %d;\n", var, idx);
+	    else if (ivl_type_base(element_type) == IVL_VT_STRING)
+		  fprintf(vvp_out, "    %%store/qobj/str v%p_0, %d;\n", var, idx);
+	    else {
+		  assert(ivl_type_base(element_type) == IVL_VT_BOOL ||
+		         ivl_type_base(element_type) == IVL_VT_LOGIC);
+		  fprintf(vvp_out, "    %%store/qobj/v v%p_0, %d, %u;\n",
+		                   var, idx, width_of_packed_type(element_type));
+	    }
       }
-#endif
+      clr_word(idx);
+
       return errors;
 }
 

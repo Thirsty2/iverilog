@@ -41,6 +41,7 @@
 # include  <cassert>
 
 # include  <iostream>
+# include  <sstream>
 # include  <cstdio>
 
 using namespace std;
@@ -67,13 +68,6 @@ using namespace std;
  * parent/child relationship since the parent can still effect them if
  * it uses the %disable/fork or %wait/fork opcodes. The i_am_detached
  * flag and detached_children set are used for this relationship.
- *
- * Children placed into a task or function scope are given special
- * treatment, which is required to make task/function calls that they
- * represent work correctly. These task/function children are copied
- * into a task_func_children set to mark them for this handling. %join
- * operations will guarantee that task/function threads are joined first,
- * before any non-task/function threads.
  *
  * It is a programming error for a thread that created threads to not
  * %join (or %join/detach) as many as it created before it %ends. The
@@ -283,8 +277,6 @@ struct vthread_s {
       set<struct vthread_s*>children;
 	/* This points to the detached children of the thread. */
       set<struct vthread_s*>detached_children;
-	/* No more than 1 of the children are tasks or functions. */
-      set<vthread_s*>task_func_children;
 	/* This points to my parent, if I have one. */
       struct vthread_s*parent;
 	/* This points to the containing scope. */
@@ -296,6 +288,13 @@ struct vthread_s {
 	/* These are used to pass non-blocking event control information. */
       vvp_net_t*event;
       uint64_t ecount;
+	/* Save the file/line information when available. */
+    private:
+      char *filenm_;
+      unsigned lineno_;
+    public:
+      void set_fileline(char *filenm, unsigned lineno);
+      string get_fileline();
 
       inline void cleanup()
       {
@@ -305,6 +304,8 @@ struct vthread_s {
 		  stack_str_.clear();
 		  pop_object(stack_obj_size_);
 	    }
+	    free(filenm_);
+	    filenm_ = 0;
 	    assert(stack_vec4_.empty());
 	    assert(stack_real_.empty());
 	    assert(stack_str_.empty());
@@ -315,6 +316,28 @@ struct vthread_s {
 inline vthread_s::vthread_s()
 {
       stack_obj_size_ = 0;
+      filenm_ = 0;
+      lineno_ = 0;
+}
+
+void vthread_s::set_fileline(char *filenm, unsigned lineno)
+{
+      assert(filenm);
+      if (!filenm_ || (strcmp(filenm_, filenm) != 0)) {
+	    free(filenm_);
+	    filenm_ = strdup(filenm);
+      }
+      lineno_ = lineno;
+}
+
+inline string vthread_s::get_fileline()
+{
+      ostringstream buf;
+      if (filenm_) {
+	    buf << filenm_ << ":" << lineno_ << ": ";
+      }
+      string res = buf.str();
+      return res;
 }
 
 void vthread_s::debug_dump(ostream&fd, const char*label)
@@ -334,10 +357,13 @@ void vthread_s::debug_dump(ostream&fd, const char*label)
       fd << "**** args_vec4 array (" << args_vec4.size() << ")..." << endl;
       for (size_t idx = 0 ; idx < args_vec4.size() ; idx += 1)
 	    fd << "    " << idx << ": " << args_vec4[idx] << endl;
+      fd << "**** file/line (";
+      if (filenm_) fd << filenm_;
+      else fd << "<no file name>";
+      fd << ":" << lineno_ << ")" << endl;
       fd << "**** Done ****" << endl;
 }
 
-static bool test_joinable(vthread_t thr, vthread_t child);
 static void do_join(vthread_t thr, vthread_t child);
 
 __vpiScope* vthread_scope(struct vthread_s*thr)
@@ -347,25 +373,24 @@ __vpiScope* vthread_scope(struct vthread_s*thr)
 
 struct vthread_s*running_thread = 0;
 
-
-void vthread_push_vec4(struct vthread_s*thr, const vvp_vector4_t&val)
+string get_fileline()
 {
-      thr->push_vec4(val);
+      return running_thread->get_fileline();
 }
 
-void vthread_push_real(struct vthread_s*thr, double val)
+void vthread_push(struct vthread_s*thr, double val)
 {
       thr->push_real(val);
 }
 
-void vthread_push_str(struct vthread_s*thr, const string&val)
+void vthread_push(struct vthread_s*thr, const string&val)
 {
       thr->push_str(val);
 }
 
-void vthread_pop_vec4(struct vthread_s*thr, unsigned depth)
+void vthread_push(struct vthread_s*thr, const vvp_vector4_t&val)
 {
-      thr->pop_vec4(depth);
+      thr->push_vec4(val);
 }
 
 void vthread_pop_real(struct vthread_s*thr, unsigned depth)
@@ -378,14 +403,19 @@ void vthread_pop_str(struct vthread_s*thr, unsigned depth)
       thr->pop_str(depth);
 }
 
-const string&vthread_get_str_stack(struct vthread_s*thr, unsigned depth)
+void vthread_pop_vec4(struct vthread_s*thr, unsigned depth)
 {
-      return thr->peek_str(depth);
+      thr->pop_vec4(depth);
 }
 
 double vthread_get_real_stack(struct vthread_s*thr, unsigned depth)
 {
       return thr->peek_real(depth);
+}
+
+const string&vthread_get_str_stack(struct vthread_s*thr, unsigned depth)
+{
+      return thr->peek_str(depth);
 }
 
 const vvp_vector4_t& vthread_get_vec4_stack(struct vthread_s*thr, unsigned depth)
@@ -408,55 +438,57 @@ template <class VVP_QUEUE> static vvp_queue*get_queue_object(vthread_t thr, vvp_
       vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
       assert(obj);
 
-      vvp_queue*dqueue = obj->get_object().peek<vvp_queue>();
-      if (dqueue == 0) {
+      vvp_queue*queue = obj->get_object().peek<vvp_queue>();
+      if (queue == 0) {
 	    assert(obj->get_object().test_nil());
-	    dqueue = new VVP_QUEUE;
-	    vvp_object_t val (dqueue);
+	    queue = new VVP_QUEUE;
+	    vvp_object_t val (queue);
 	    vvp_net_ptr_t ptr (net, 0);
 	    vvp_send_object(ptr, val, thr->wt_context);
       }
 
-      return dqueue;
+      return queue;
 }
 
 /*
  * The following are used to allow a common template to be written for
  * queue real/string/vec4 operations
  */
-inline static void pop_value(double&value, vthread_t thr, unsigned)
+inline static void pop_value(vthread_t thr, double&value, unsigned)
 {
       value = thr->pop_real();
 }
 
-inline static void pop_value(string&value, vthread_t thr, unsigned)
+inline static void pop_value(vthread_t thr, string&value, unsigned)
 {
       value = thr->pop_str();
 }
 
-inline static void pop_value(vvp_vector4_t&value, vthread_t thr, unsigned wid)
+inline static void pop_value(vthread_t thr, vvp_vector4_t&value, unsigned wid)
 {
       value = thr->pop_vec4();
       assert(value.size() == wid);
 }
 
-
 /*
  * The following are used to allow the queue templates to print correctly.
  */
-inline static void print_queue_type(double)
+inline static string get_queue_type(double&)
 {
-      cerr << "queue<real>";
+      return "queue<real>";
 }
 
-inline static void print_queue_type(string)
+inline static string get_queue_type(string&)
 {
-      cerr << "queue<string>";
+      return "queue<string>";
 }
 
-inline static void print_queue_type(vvp_vector4_t value)
+inline static string get_queue_type(vvp_vector4_t value)
 {
-      cerr << "queue<vector[" << value.size() << "]>";
+      ostringstream buf;
+      buf << "queue<vector[" << value.size() << "]>";
+      string res = buf.str();
+      return res;
 }
 
 inline static void print_queue_value(double value)
@@ -473,6 +505,25 @@ inline static void print_queue_value(vvp_vector4_t value)
 {
       cerr << value;
 }
+
+/*
+ * The following are used to get a darray/queue default value.
+ */
+inline static void dq_default(double&value, unsigned)
+{
+      value = 0.0;
+}
+
+inline static void dq_default(string&value, unsigned)
+{
+      value = "";
+}
+
+inline static void dq_default(vvp_vector4_t&value, unsigned wid)
+{
+      value = vvp_vector4_t(wid);
+}
+
 
 template <class T> T coerce_to_width(const T&that, unsigned width)
 {
@@ -1378,13 +1429,10 @@ static bool do_callf_void(vthread_t thr, vthread_t child)
         // Execute the function. This SHOULD run the function to completion,
         // but there are some exceptional situations where it won't.
       assert(child->parent_scope->get_type_code() == vpiFunction);
-      thr->task_func_children.insert(child);
       child->is_scheduled = 1;
       child->i_am_in_function = 1;
       vthread_run(child);
       running_thread = thr;
-
-      assert(test_joinable(thr, child));
 
       if (child->i_have_ended) {
 	    do_join(thr, child);
@@ -1613,7 +1661,8 @@ bool do_cast_vec_dar(vthread_t thr, vvp_code_t cp, bool as_vec4)
 
       vvp_vector4_t vec = darray->get_bitstream(as_vec4);
       if (vec.size() != wid) {
-            cerr << "VVP error: size mismatch when casting dynamic array to vector." << endl;
+	    cerr << thr->get_fileline()
+	         << "VVP error: size mismatch when casting dynamic array to vector." << endl;
             thr->push_vec4(vvp_vector4_t(wid));
             schedule_stop(0);
             return false;
@@ -1649,7 +1698,8 @@ bool of_CAST_VEC4_STR(vthread_t thr, vvp_code_t cp)
       vvp_vector4_t vec(wid, BIT4_0);
 
       if (wid != 8*str.length()) {
-            cerr << "VVP error: size mismatch when casting string to vector." << endl;
+	    cerr << thr->get_fileline()
+	         << "VVP error: size mismatch when casting string to vector." << endl;
             thr->push_vec4(vec);
             schedule_stop(0);
             return false;
@@ -1972,7 +2022,8 @@ static void do_CMPU(vthread_t thr, const vvp_vector4_t&lval, const vvp_vector4_t
       vvp_bit4_t lt = BIT4_0;
 
       if (rval.size() != lval.size()) {
-	    cerr << "VVP ERROR: %cmp/u operand width mismatch: lval=" << lval
+	    cerr << thr->get_fileline()
+	         << "VVP ERROR: %cmp/u operand width mismatch: lval=" << lval
 		 << ", rval=" << rval << endl;
       }
       assert(rval.size() == lval.size());
@@ -2476,12 +2527,14 @@ bool of_DELETE_ELEM(vthread_t thr, vvp_code_t cp)
 
       int64_t idx_val = thr->words[3].w_int;
       if (thr->flags[4] == BIT4_1) {
-	    cerr << "Warning: skipping queue delete() with undefined index."
+	    cerr << thr->get_fileline()
+	         << "Warning: skipping queue delete() with undefined index."
 	         << endl;
 	    return true;
       }
       if (idx_val < 0) {
-	    cerr << "Warning: skipping queue delete() with negative index."
+	    cerr << thr->get_fileline()
+	         << "Warning: skipping queue delete() with negative index."
 	         << endl;
 	    return true;
       }
@@ -2490,17 +2543,19 @@ bool of_DELETE_ELEM(vthread_t thr, vvp_code_t cp)
       vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
       assert(obj);
 
-      vvp_queue*dqueue = obj->get_object().peek<vvp_queue>();
-      if (dqueue == 0) {
-	    cerr << "Warning: skipping delete(" << idx
+      vvp_queue*queue = obj->get_object().peek<vvp_queue>();
+      if (queue == 0) {
+	    cerr << thr->get_fileline()
+	         << "Warning: skipping delete(" << idx
 	         << ") on empty queue." << endl;
       } else {
-	    size_t size = dqueue->get_size();
+	    size_t size = queue->get_size();
 	    if (idx >= size) {
-		  cerr << "Warning: skipping out of range delete(" << idx
+		  cerr << thr->get_fileline()
+		       << "Warning: skipping out of range delete(" << idx
 		       << ") on queue of size " << size << "." << endl;
 	    } else {
-		  dqueue->erase(idx);
+		  queue->erase(idx);
 	    }
       }
 
@@ -2533,11 +2588,11 @@ bool of_DELETE_TAIL(vthread_t thr, vvp_code_t cp)
       vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
       assert(obj);
 
-      vvp_queue*dqueue = obj->get_object().peek<vvp_queue>();
-      assert(dqueue);
+      vvp_queue*queue = obj->get_object().peek<vvp_queue>();
+      assert(queue);
 
       unsigned idx = thr->words[cp->bit_idx[0]].w_int;
-      dqueue->erase_tail(idx);
+      queue->erase_tail(idx);
 
       return true;
 }
@@ -2571,7 +2626,7 @@ static bool do_disable(vthread_t thr, vthread_t match)
       }
 
       vthread_t parent = thr->parent;
-      if (parent && parent->i_am_joining && test_joinable(parent, thr)) {
+      if (parent && parent->i_am_joining) {
 	      // If a parent is waiting in a %join, wake it up. Note
 	      // that it is possible to be waiting in a %join yet
 	      // already scheduled if multiple child threads are
@@ -2992,13 +3047,6 @@ bool of_END(vthread_t thr, vvp_code_t)
 	    vthread_t tmp = thr->parent;
 	    assert(! thr->i_am_detached);
 
-	      // Detect that the parent is waiting on a task or function
-	      // thread. These threads must be reaped first. If the
-	      // parent is waiting on a task or function (other than me)
-	      // then go into zombie state to be picked up later.
-	    if (! test_joinable(tmp, thr))
-		  return false;
-
 	    tmp->i_am_joining = 0;
 	    schedule_vthread(tmp, 0, true);
 	    do_join(tmp, thr);
@@ -3309,18 +3357,6 @@ bool of_FORK(vthread_t thr, vvp_code_t cp)
       child->parent = thr;
       thr->children.insert(child);
 
-      switch (cp->scope->get_type_code()) {
-          case vpiFunction:
-	      // Functions should be started by the %callf opcodes, and
-	      // NOT by the %fork instruction
-	    assert(0);
-          case vpiTask:
-	    thr->task_func_children.insert(child);
-	    break;
-          default:
-	    break;
-      }
-
       if (thr->i_am_in_function) {
 	    child->is_scheduled = 1;
 	    child->i_am_in_function = 1;
@@ -3415,7 +3451,8 @@ bool of_IX_GETV(vthread_t thr, vvp_code_t cp)
       vvp_signal_value*sig = dynamic_cast<vvp_signal_value*>(net->fil);
       if (sig == 0) {
 	    assert(net->fil);
-	    cerr << "%%ix/getv error: Net arg not a vector signal? "
+	    cerr << thr->get_fileline()
+	         << "%%ix/getv error: Net arg not a vector signal? "
 		 << typeid(*net->fil).name() << endl;
       }
       assert(sig);
@@ -3445,7 +3482,8 @@ bool of_IX_GETV_S(vthread_t thr, vvp_code_t cp)
       vvp_signal_value*sig = dynamic_cast<vvp_signal_value*>(net->fil);
       if (sig == 0) {
 	    assert(net->fil);
-	    cerr << "%%ix/getv/s error: Net arg not a vector signal? "
+	    cerr << thr->get_fileline()
+	         << "%%ix/getv/s error: Net arg not a vector signal? "
 		 << "fun=" << typeid(*net->fil).name()
 		 << ", fil=" << (net->fil? typeid(*net->fil).name() : "<>")
 		 << endl;
@@ -3649,21 +3687,9 @@ bool of_JMP1XZ(vthread_t thr, vvp_code_t cp)
  * children know to wake me when they finish.
  */
 
-static bool test_joinable(vthread_t thr, vthread_t child)
-{
-      set<vthread_t>::iterator cur = thr->task_func_children.find(child);
-      if (! thr->task_func_children.empty() && cur == thr->task_func_children.end())
-	    return false;
-
-      return true;
-}
-
 static void do_join(vthread_t thr, vthread_t child)
 {
       assert(child->parent == thr);
-
-	/* Remove the thread from the task/function set if needed. */
-      thr->task_func_children.erase(child);
 
         /* If the immediate child thread is in an automatic scope... */
       if (child->wt_context) {
@@ -3695,9 +3721,6 @@ static bool do_join_opcode(vthread_t thr)
 	    if (! curp->i_have_ended)
 		  continue;
 
-	    if (! test_joinable(thr, curp))
-		  continue;
-
 	      // found something!
 	    do_join(thr, curp);
 	    return true;
@@ -3722,7 +3745,6 @@ bool of_JOIN_DETACH(vthread_t thr, vvp_code_t cp)
 {
       unsigned long count = cp->number;
 
-      assert(thr->task_func_children.empty());
       assert(count == thr->children.size());
 
       while (! thr->children.empty()) {
@@ -3769,29 +3791,35 @@ bool of_LOAD_AR(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
-/*
- * %load/dar/r <array-label>;
- */
-bool of_LOAD_DAR_R(vthread_t thr, vvp_code_t cp)
+template <typename ELEM>
+static bool load_dar(vthread_t thr, vvp_code_t cp)
 {
       int64_t adr = thr->words[3].w_int;
       vvp_net_t*net = cp->net;
-
       assert(net);
+
       vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
       assert(obj);
 
       vvp_darray*darray = obj->get_object().peek<vvp_darray>();
 
-      double word;
+      ELEM word;
       if (darray &&
           (adr >= 0) && (thr->flags[4] == BIT4_0)) // A defined address >= 0
 	    darray->get_word(adr, word);
       else
-	    word = 0.0;
+	    dq_default(word, obj->size());
 
-      thr->push_real(word);
+      vthread_push(thr, word);
       return true;
+}
+
+/*
+ * %load/dar/r <array-label>;
+ */
+bool of_LOAD_DAR_R(vthread_t thr, vvp_code_t cp)
+{
+      return load_dar<double>(thr, cp);
 }
 
 /*
@@ -3799,24 +3827,7 @@ bool of_LOAD_DAR_R(vthread_t thr, vvp_code_t cp)
  */
 bool of_LOAD_DAR_STR(vthread_t thr, vvp_code_t cp)
 {
-      int64_t adr = thr->words[3].w_int;
-      vvp_net_t*net = cp->net;
-
-      assert(net);
-      vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
-      assert(obj);
-
-      vvp_darray*darray = obj->get_object().peek<vvp_darray>();
-
-      string word;
-      if (darray &&
-          (adr >= 0) && (thr->flags[4] == BIT4_0)) // A defined address >= 0
-	    darray->get_word(adr, word);
-      else
-	    word = "";
-
-      thr->push_str(word);
-      return true;
+      return load_dar<string>(thr, cp);
 }
 
 /*
@@ -3824,24 +3835,7 @@ bool of_LOAD_DAR_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_LOAD_DAR_VEC4(vthread_t thr, vvp_code_t cp)
 {
-      int64_t adr = thr->words[3].w_int;
-      vvp_net_t*net = cp->net;
-
-      assert(net);
-      vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
-      assert(obj);
-
-      vvp_darray*darray = obj->get_object().peek<vvp_darray>();
-
-      vvp_vector4_t word;
-      if (darray &&
-          (adr >= 0) && (thr->flags[4] == BIT4_0)) // A defined address >= 0
-	    darray->get_word(adr, word);
-      else
-	    word = vvp_vector4_t(obj->size());
-
-      thr->push_vec4(word);
-      return true;
+      return load_dar<vvp_vector4_t>(thr, cp);
 }
 
 /*
@@ -3949,7 +3943,8 @@ bool of_LOAD_VEC4(vthread_t thr, vvp_code_t cp)
 	// signal functor. Only signals save their vector value.
       vvp_signal_value*sig = dynamic_cast<vvp_signal_value*> (net->fil);
       if (sig == 0) {
-	    cerr << "%load/v error: Net arg not a signal? "
+	    cerr << thr->get_fileline()
+	         << "%load/v error: Net arg not a signal? "
 		 << (net->fil ? typeid(*net->fil).name() : typeid(*net->fun).name()) << endl;
 	    assert(sig);
       }
@@ -4538,7 +4533,8 @@ bool of_NEW_DARRAY(vthread_t thr, vvp_code_t cp)
       } else if (strcmp(text,"S") == 0) {
 	    obj = new vvp_darray_string(size);
       } else {
-	    cerr << "Internal error: Unsupported dynamic array type: "
+	    cerr << get_fileline()
+	         << "Internal error: Unsupported dynamic array type: "
 	         << text << "." << endl;
 	    assert(0);
       }
@@ -4762,9 +4758,7 @@ bool of_POP_OBJ(vthread_t thr, vvp_code_t cp)
 bool of_POP_REAL(vthread_t thr, vvp_code_t cp)
 {
       unsigned cnt = cp->number;
-      for (unsigned idx = 0 ; idx < cnt ; idx += 1) {
-	    (void) thr->pop_real();
-      }
+      thr->pop_real(cnt);
       return true;
 }
 
@@ -4896,6 +4890,37 @@ bool of_PROP_OBJ(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
+static void get_from_obj(unsigned pid, vvp_cobject*cobj, double&val)
+{
+      val = cobj->get_real(pid);
+}
+
+static void get_from_obj(unsigned pid, vvp_cobject*cobj, string&val)
+{
+      val = cobj->get_string(pid);
+}
+
+static void get_from_obj(unsigned pid, vvp_cobject*cobj, vvp_vector4_t&val)
+{
+      cobj->get_vec4(pid, val);
+}
+
+template <typename ELEM>
+static bool prop(vthread_t thr, vvp_code_t cp)
+{
+      unsigned pid = cp->number;
+
+      vvp_object_t&obj = thr->peek_object();
+      vvp_cobject*cobj = obj.peek<vvp_cobject>();
+      assert(cobj);
+
+      ELEM val;
+      get_from_obj(pid, cobj, val);
+      vthread_push(thr, val);
+
+      return true;
+}
+
 /*
  * %prop/r <pid>
  *
@@ -4904,15 +4929,7 @@ bool of_PROP_OBJ(vthread_t thr, vvp_code_t cp)
  */
 bool of_PROP_R(vthread_t thr, vvp_code_t cp)
 {
-      unsigned pid = cp->number;
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-
-      double val = cobj->get_real(pid);
-      thr->push_real(val);
-
-      return true;
+      return prop<double>(thr, cp);
 }
 
 /*
@@ -4923,15 +4940,7 @@ bool of_PROP_R(vthread_t thr, vvp_code_t cp)
  */
 bool of_PROP_STR(vthread_t thr, vvp_code_t cp)
 {
-      unsigned pid = cp->number;
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-
-      string val = cobj->get_string(pid);
-      thr->push_str(val);
-
-      return true;
+      return prop<string>(thr, cp);
 }
 
 /*
@@ -4942,16 +4951,7 @@ bool of_PROP_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_PROP_V(vthread_t thr, vvp_code_t cp)
 {
-      unsigned pid = cp->number;
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-
-      vvp_vector4_t val;
-      cobj->get_vec4(pid, val);
-      thr->push_vec4(val);
-
-      return true;
+      return prop<vvp_vector4_t>(thr, cp);
 }
 
 bool of_PUSHI_REAL(vthread_t thr, vvp_code_t cp)
@@ -5145,20 +5145,21 @@ static bool qinsert(vthread_t thr, vvp_code_t cp, unsigned wid=0)
       ELEM value;
       vvp_net_t*net = cp->net;
       unsigned max_size = thr->words[cp->bit_idx[0]].w_int;
-      pop_value(value, thr, wid); // Pop the value to store.
+      pop_value(thr, value, wid); // Pop the value to store.
 
       vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
       assert(queue);
       if (idx < 0) {
-	    cerr << "Warning: cannot insert at a negative ";
-	    print_queue_type(value);
-	    cerr << " index (" << idx << "). ";
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot insert at a negative "
+	         << get_queue_type(value)
+	         << " index (" << idx << "). ";
 	    print_queue_value(value);
 	    cerr << " was not added." << endl;
       } else if (thr->flags[4] != BIT4_0) {
-	    cerr << "Warning: cannot insert at an undefined ";
-	    print_queue_type(value);
-	    cerr << " index. ";
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot insert at an undefined "
+	         << get_queue_type(value) << " index. ";
 	    print_queue_value(value);
 	    cerr << " was not added." << endl;
       } else
@@ -5193,21 +5194,6 @@ bool of_QINSERT_V(vthread_t thr, vvp_code_t cp)
 /*
  * Helper functions used in the queue pop templates
  */
-inline static void qdefault(double&value, unsigned)
-{
-      value = 0.0;
-}
-
-inline static void qdefault(string&value, unsigned)
-{
-      value = "";
-}
-
-inline static void qdefault(vvp_vector4_t&value, unsigned wid)
-{
-      value = vvp_vector4_t(wid);
-}
-
 inline void push_value(vthread_t thr, double value, unsigned)
 {
       thr->push_real(value);
@@ -5225,7 +5211,9 @@ inline void push_value(vthread_t thr, vvp_vector4_t value, unsigned wid)
 }
 
 template <typename ELEM, class QTYPE>
-static bool qpop_b(vthread_t thr, vvp_code_t cp, unsigned wid=0)
+static bool q_pop(vthread_t thr, vvp_code_t cp,
+                  void (*get_val_func)(vvp_queue*, ELEM&),
+                  const char*loc, unsigned wid)
 {
       vvp_net_t*net = cp->net;
 
@@ -5236,17 +5224,29 @@ static bool qpop_b(vthread_t thr, vvp_code_t cp, unsigned wid=0)
 
       ELEM value;
       if (size) {
-	    queue->get_word(size-1, value);
-	    queue->pop_back();
+	    get_val_func(queue, value);
       } else {
-	    qdefault(value, wid);
-	    cerr << "Warning: pop_back() on empty ";
-	    print_queue_type(value);
-	    cerr << "." << endl;
+	    dq_default(value, wid);
+	    cerr << thr->get_fileline()
+	         << "Warning: pop_" << loc << "() on empty "
+	         << get_queue_type(value) << "." << endl;
       }
 
       push_value(thr, value, wid);
       return true;
+}
+
+template <typename ELEM>
+static void get_back_value(vvp_queue*queue, ELEM&value)
+{
+      queue->get_word(queue->get_size()-1, value);
+      queue->pop_back();
+}
+
+template <typename ELEM, class QTYPE>
+static bool qpop_b(vthread_t thr, vvp_code_t cp, unsigned wid=0)
+{
+      return q_pop<ELEM, QTYPE>(thr, cp, get_back_value<ELEM>, "back", wid);
 }
 
 /*
@@ -5273,29 +5273,17 @@ bool of_QPOP_B_V(vthread_t thr, vvp_code_t cp)
       return qpop_b<vvp_vector4_t, vvp_queue_vec4>(thr, cp, cp->bit_idx[0]);
 }
 
+template <typename ELEM>
+static void get_front_value(vvp_queue*queue, ELEM&value)
+{
+      queue->get_word(0, value);
+      queue->pop_front();
+}
+
 template <typename ELEM, class QTYPE>
 static bool qpop_f(vthread_t thr, vvp_code_t cp, unsigned wid=0)
 {
-      vvp_net_t*net = cp->net;
-
-      vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
-      assert(queue);
-
-      size_t size = queue->get_size();
-
-      ELEM value;
-      if (size) {
-	    queue->get_word(0, value);
-	    queue->pop_front();
-      } else {
-	    qdefault(value, wid);
-	    cerr << "Warning: pop_front() on empty ";
-	    print_queue_type(value);
-	    cerr << "." << endl;
-      }
-
-      push_value(thr, value, wid);
-      return true;
+      return q_pop<ELEM, QTYPE>(thr, cp, get_front_value<ELEM>, "front", wid);
 }
 
 
@@ -5401,25 +5389,81 @@ bool of_REPLICATE(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
+static void poke_val(vthread_t fun_thr, unsigned depth, double val)
+{
+      fun_thr->parent->poke_real(depth, val);
+}
+
+static void poke_val(vthread_t fun_thr, unsigned depth, string val)
+{
+      fun_thr->parent->poke_str(depth, val);
+}
+
+static size_t get_max(vthread_t fun_thr, double&)
+{
+      return fun_thr->args_real.size();
+}
+
+static size_t get_max(vthread_t fun_thr, string&)
+{
+      return fun_thr->args_str.size();
+}
+
+static size_t get_max(vthread_t fun_thr, vvp_vector4_t&)
+{
+      return fun_thr->args_vec4.size();
+}
+
+static unsigned get_depth(vthread_t fun_thr, size_t index, double&)
+{
+      return fun_thr->args_real[index];
+}
+
+static unsigned get_depth(vthread_t fun_thr, size_t index, string&)
+{
+      return fun_thr->args_str[index];
+}
+
+static unsigned get_depth(vthread_t fun_thr, size_t index, vvp_vector4_t&)
+{
+      return fun_thr->args_vec4[index];
+}
+
+static vthread_t get_func(vthread_t thr)
+{
+      vthread_t fun_thr = thr;
+
+      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
+	    assert(fun_thr->parent);
+	    fun_thr = fun_thr->parent;
+      }
+
+      return fun_thr;
+}
+
+template <typename ELEM>
+static bool ret(vthread_t thr, vvp_code_t cp)
+{
+      size_t index = cp->number;
+      ELEM val;
+      pop_value(thr, val, 0);
+
+      vthread_t fun_thr = get_func(thr);
+      assert(index < get_max(fun_thr, val));
+
+      unsigned depth = get_depth(fun_thr, index, val);
+	// Use the depth to put the value into the stack of
+	// the parent thread.
+      poke_val(fun_thr, depth, val);
+      return true;
+}
+
 /*
  * %ret/real <index>
  */
 bool of_RET_REAL(vthread_t thr, vvp_code_t cp)
 {
-      size_t index = cp->number;
-      double val = thr->pop_real();
-
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_real.size());
-      unsigned depth = fun_thr->args_real[index];
-	// Use the depth to put the value into the stack of
-	// the parent thread.
-      fun_thr->parent->poke_real(depth, val);
-      return true;
+      return ret<double>(thr, cp);
 }
 
 /*
@@ -5427,20 +5471,7 @@ bool of_RET_REAL(vthread_t thr, vvp_code_t cp)
  */
 bool of_RET_STR(vthread_t thr, vvp_code_t cp)
 {
-      size_t index = cp->number;
-      string val = thr->pop_str();
-
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_str.size());
-      unsigned depth = fun_thr->args_str[index];
-	// Use the depth to put the value into the stack of
-	// the parent thread.
-      fun_thr->parent->poke_str(depth, val);
-      return true;
+      return ret<string>(thr, cp);
 }
 
 /*
@@ -5451,19 +5482,15 @@ bool of_RET_VEC4(vthread_t thr, vvp_code_t cp)
       size_t index = cp->number;
       unsigned off_index = cp->bit_idx[0];
       int wid = cp->bit_idx[1];
+      vvp_vector4_t&val = thr->peek_vec4();
 
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_vec4.size());
-      unsigned depth = fun_thr->args_vec4[index];
+      vthread_t fun_thr = get_func(thr);
+      assert(index < get_max(fun_thr, val));
+      unsigned depth = get_depth(fun_thr, index, val);
 
       int off = off_index? thr->words[off_index].w_int : 0;
       const int sig_value_size = fun_thr->parent->peek_vec4(depth).size();
 
-      vvp_vector4_t&val = thr->peek_vec4();
       unsigned val_size = val.size();
 
       if (off_index!=0 && thr->flags[4] == BIT4_1) {
@@ -5514,25 +5541,43 @@ bool of_RET_VEC4(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
+static void push_from_parent(vthread_t thr, vthread_t fun_thr, unsigned depth, double&)
+{
+      thr->push_real(fun_thr->parent->peek_real(depth));
+}
+
+static void push_from_parent(vthread_t thr, vthread_t fun_thr, unsigned depth, string&)
+{
+      thr->push_str(fun_thr->parent->peek_str(depth));
+}
+
+static void push_from_parent(vthread_t thr, vthread_t fun_thr, unsigned depth, vvp_vector4_t&)
+{
+      thr->push_vec4(fun_thr->parent->peek_vec4(depth));
+}
+
+template <typename ELEM>
+static bool retload(vthread_t thr, vvp_code_t cp)
+{
+      size_t index = cp->number;
+      ELEM type;
+
+      vthread_t fun_thr = get_func(thr);
+      assert(index < get_max(fun_thr, type));
+
+      unsigned depth = get_depth(fun_thr, index, type);
+	// Use the depth to extract the values from the stack
+	// of the parent thread.
+      push_from_parent(thr, fun_thr, depth, type);
+      return true;
+}
+
 /*
  * %retload/real <index>
  */
 bool of_RETLOAD_REAL(vthread_t thr, vvp_code_t cp)
 {
-      size_t index = cp->number;
-
-
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_real.size());
-      unsigned depth = fun_thr->args_real[index];
-	// Use the depth to extract the values from the stack
-	// of the parent thread.
-      thr->push_real(fun_thr->parent->peek_real(depth));
-      return true;
+      return retload<double>(thr, cp);
 }
 
 /*
@@ -5540,20 +5585,7 @@ bool of_RETLOAD_REAL(vthread_t thr, vvp_code_t cp)
  */
 bool of_RETLOAD_STR(vthread_t thr, vvp_code_t cp)
 {
-      size_t index = cp->number;
-
-
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_str.size());
-      unsigned depth = fun_thr->args_str[index];
-	// Use the depth to extract the values from the stack
-	// of the parent thread.
-      thr->push_str(fun_thr->parent->peek_str(depth));
-      return true;
+      return retload<string>(thr, cp);
 }
 
 /*
@@ -5561,19 +5593,7 @@ bool of_RETLOAD_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_RETLOAD_VEC4(vthread_t thr, vvp_code_t cp)
 {
-      size_t index = cp->number;
-
-      vthread_t fun_thr = thr;
-      while (fun_thr->parent_scope->get_type_code() != vpiFunction) {
-	    assert(fun_thr->parent);
-	    fun_thr = fun_thr->parent;
-      }
-      assert(index < fun_thr->args_vec4.size());
-      unsigned depth = fun_thr->args_vec4[index];
-	// Use the depth to put the value into the stack of
-	// the parent thread.
-      thr->push_vec4(fun_thr->parent->peek_vec4(depth));
-      return true;
+      return retload<vvp_vector4_t>(thr, cp);
 }
 
 bool of_SCOPY(vthread_t thr, vvp_code_t)
@@ -5587,14 +5607,28 @@ bool of_SCOPY(vthread_t thr, vvp_code_t)
       return true;
 }
 
-/*
- * %set/dar/obj/real <index>
- */
-bool of_SET_DAR_OBJ_REAL(vthread_t thr, vvp_code_t cp)
+static void thread_peek(vthread_t thr, double&value)
+{
+      value = thr->peek_real(0);
+}
+
+static void thread_peek(vthread_t thr, string&value)
+{
+      value = thr->peek_str(0);
+}
+
+static void thread_peek(vthread_t thr, vvp_vector4_t&value)
+{
+      value = thr->peek_vec4(0);
+}
+
+template <typename ELEM>
+static bool set_dar_obj(vthread_t thr, vvp_code_t cp)
 {
       unsigned adr = thr->words[cp->number].w_int;
 
-      double value = thr->peek_real(0);
+      ELEM value;
+      thread_peek(thr, value);
 
       vvp_object_t&top = thr->peek_object();
       vvp_darray*darray = top.peek<vvp_darray>();
@@ -5605,20 +5639,11 @@ bool of_SET_DAR_OBJ_REAL(vthread_t thr, vvp_code_t cp)
 }
 
 /*
- * %set/dar/obj/str <index>
+ * %set/dar/obj/real <index>
  */
-bool of_SET_DAR_OBJ_VEC4(vthread_t thr, vvp_code_t cp)
+bool of_SET_DAR_OBJ_REAL(vthread_t thr, vvp_code_t cp)
 {
-      unsigned adr = thr->words[cp->number].w_int;
-
-      vvp_vector4_t value = thr->peek_vec4(0);
-
-      vvp_object_t&top = thr->peek_object();
-      vvp_darray*darray = top.peek<vvp_darray>();
-      assert(darray);
-
-      darray->set_word(adr, value);
-      return true;
+      return set_dar_obj<double>(thr, cp);
 }
 
 /*
@@ -5626,16 +5651,15 @@ bool of_SET_DAR_OBJ_VEC4(vthread_t thr, vvp_code_t cp)
  */
 bool of_SET_DAR_OBJ_STR(vthread_t thr, vvp_code_t cp)
 {
-      unsigned adr = thr->words[cp->number].w_int;
+      return set_dar_obj<string>(thr, cp);
+}
 
-      string value = thr->peek_str(0);
-
-      vvp_object_t&top = thr->peek_object();
-      vvp_darray*darray = top.peek<vvp_darray>();
-      assert(darray);
-
-      darray->set_word(adr, value);
-      return true;
+/*
+ * %set/dar/obj/vec4 <index>
+ */
+bool of_SET_DAR_OBJ_VEC4(vthread_t thr, vvp_code_t cp)
+{
+      return set_dar_obj<vvp_vector4_t>(thr, cp);
 }
 
 /*
@@ -5753,33 +5777,86 @@ bool of_SPLIT_VEC4(vthread_t thr, vvp_code_t cp)
 }
 
 /*
- * %store/dar/real <var>
+ * The following are used to allow the darray templates to print correctly.
  */
-bool of_STORE_DAR_R(vthread_t thr, vvp_code_t cp)
+inline static string get_darray_type(double&)
+{
+      return "darray<real>";
+}
+
+inline static string get_darray_type(string&)
+{
+      return "darray<string>";
+}
+
+inline static string get_darray_type(vvp_vector4_t value)
+{
+      ostringstream buf;
+      buf << "darray<vector[" << value.size() << "]>";
+      string res = buf.str();
+      return res;
+}
+
+/*
+ * The following are used to allow a common template to be written for
+ * darray real/string/vec4 operations
+ */
+inline static void dar_pop_value(vthread_t thr, double&value)
+{
+      value = thr->pop_real();
+}
+
+inline static void dar_pop_value(vthread_t thr, string&value)
+{
+      value = thr->pop_str();
+}
+
+inline static void dar_pop_value(vthread_t thr, vvp_vector4_t&value)
+{
+      value = thr->pop_vec4();
+}
+
+template <typename ELEM>
+static bool store_dar(vthread_t thr, vvp_code_t cp)
 {
       int64_t adr = thr->words[3].w_int;
-      double value = thr->pop_real(); // Pop the real value to store...
-      vvp_net_t*net = cp->net;
+      ELEM value;
+	// FIXME: Can we get the size of the underlying array element
+	//        and then use the normal pop_value?
+      dar_pop_value(thr, value);
 
+      vvp_net_t*net = cp->net;
       assert(net);
+
       vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
       assert(obj);
 
       vvp_darray*darray = obj->get_object().peek<vvp_darray>();
 
       if (adr < 0)
-	    cerr << "Warning: cannot write to a negative array<real> index ("
-	         << adr << ")." << endl;
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot write to a negative " << get_darray_type(value)
+	         << " index (" << adr << ")." << endl;
       else if (thr->flags[4] != BIT4_0)
-	    cerr << "Warning: cannot write to an undefined array<real> index."
-	         << endl;
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot write to an undefined " << get_darray_type(value)
+	         << " index." << endl;
       else if (darray)
 	    darray->set_word(adr, value);
       else
-	    cerr << "Warning: cannot write to an undefined array<real>."
-	         << endl;
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot write to an undefined " << get_darray_type(value)
+	         << "." << endl;
 
       return true;
+}
+
+/*
+ * %store/dar/real <var>
+ */
+bool of_STORE_DAR_R(vthread_t thr, vvp_code_t cp)
+{
+      return store_dar<double>(thr, cp);
 }
 
 /*
@@ -5787,29 +5864,7 @@ bool of_STORE_DAR_R(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_DAR_STR(vthread_t thr, vvp_code_t cp)
 {
-      int64_t adr = thr->words[3].w_int;
-      string value = thr->pop_str(); // Pop the string to be stored...
-      vvp_net_t*net = cp->net;
-
-      assert(net);
-      vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
-      assert(obj);
-
-      vvp_darray*darray = obj->get_object().peek<vvp_darray>();
-
-      if (adr < 0)
-	    cerr << "Warning: cannot write to a negative array<string> index ("
-	         << adr << ")." << endl;
-      else if (thr->flags[4] != BIT4_0)
-	    cerr << "Warning: cannot write to an undefined array<string> index."
-	         << endl;
-      else if (darray)
-	    darray->set_word(adr, value);
-      else
-	    cerr << "Warning: cannot write to an undefined array<string>."
-	         << endl;
-
-      return true;
+      return store_dar<string>(thr, cp);
 }
 
 /*
@@ -5817,29 +5872,7 @@ bool of_STORE_DAR_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_DAR_VEC4(vthread_t thr, vvp_code_t cp)
 {
-      int64_t adr = thr->words[3].w_int;
-      vvp_vector4_t value = thr->pop_vec4(); // Pop the vector4 value to be store...
-      vvp_net_t*net = cp->net;
-
-      assert(net);
-      vvp_fun_signal_object*obj = dynamic_cast<vvp_fun_signal_object*> (net->fun);
-      assert(obj);
-
-      vvp_darray*darray = obj->get_object().peek<vvp_darray>();
-
-      if (adr < 0)
-	    cerr << "Warning: cannot write to a negative array<vector["
-	         << value.size() << "]> index (" << adr << ")." << endl;
-      else if (thr->flags[4] != BIT4_0)
-	    cerr << "Warning: cannot write to an undefined array<vector["
-	         << value.size() << "]> index." << endl;
-      else if (darray)
-	    darray->set_word(adr, value);
-      else
-	    cerr << "Warning: cannot write to an undefined array<vector["
-	         << value.size() << "]>." << endl;
-
-      return true;
+      return store_dar<vvp_vector4_t>(thr, cp);
 }
 
 bool of_STORE_OBJ(vthread_t thr, vvp_code_t cp)
@@ -5901,6 +5934,54 @@ bool of_STORE_PROP_OBJ(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
+static void pop_prop_val(vthread_t thr, double&val, unsigned)
+{
+      val = thr->pop_real();
+}
+
+static void pop_prop_val(vthread_t thr, string&val, unsigned)
+{
+      val = thr->pop_str();
+}
+
+static void pop_prop_val(vthread_t thr, vvp_vector4_t&val, unsigned wid)
+{
+      val = thr->pop_vec4();
+      assert(val.size() >= wid);
+      val.resize(wid);
+}
+
+static void set_val(vvp_cobject*cobj, size_t pid, double&val)
+{
+      cobj->set_real(pid, val);
+}
+
+static void set_val(vvp_cobject*cobj, size_t pid, string&val)
+{
+      cobj->set_string(pid, val);
+}
+
+static void set_val(vvp_cobject*cobj, size_t pid, vvp_vector4_t&val)
+{
+      cobj->set_vec4(pid, val);
+}
+
+template <typename ELEM>
+static bool store_prop(vthread_t thr, vvp_code_t cp, unsigned wid=0)
+{
+      size_t pid = cp->number;
+      ELEM val;
+      pop_prop_val(thr, val, wid); // Pop the value to store.
+
+      vvp_object_t&obj = thr->peek_object();
+      vvp_cobject*cobj = obj.peek<vvp_cobject>();
+      assert(cobj);
+
+      set_val(cobj, pid, val);
+
+      return true;
+}
+
 /*
  * %store/prop/r <id>
  *
@@ -5910,16 +5991,7 @@ bool of_STORE_PROP_OBJ(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_PROP_R(vthread_t thr, vvp_code_t cp)
 {
-      size_t pid = cp->number;
-      double val = thr->pop_real();
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-      assert(cobj);
-
-      cobj->set_real(pid, val);
-
-      return true;
+      return store_prop<double>(thr, cp);
 }
 
 /*
@@ -5931,16 +6003,7 @@ bool of_STORE_PROP_R(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_PROP_STR(vthread_t thr, vvp_code_t cp)
 {
-      size_t pid = cp->number;
-      string val = thr->pop_str();
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-      assert(cobj);
-
-      cobj->set_string(pid, val);
-
-      return true;
+      return store_prop<string>(thr, cp);
 }
 
 /*
@@ -5951,20 +6014,7 @@ bool of_STORE_PROP_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_PROP_V(vthread_t thr, vvp_code_t cp)
 {
-      size_t pid = cp->number;
-      unsigned wid = cp->bit_idx[0];
-
-      vvp_vector4_t val = thr->pop_vec4();
-
-      assert(val.size() >= wid);
-      val.resize(wid);
-
-      vvp_object_t&obj = thr->peek_object();
-      vvp_cobject*cobj = obj.peek<vvp_cobject>();
-      assert(cobj);
-
-      cobj->set_vec4(pid, val);
-      return true;
+      return store_prop<vvp_vector4_t>(thr, cp, cp->bit_idx[0]);
 }
 
 template <typename ELEM, class QTYPE>
@@ -5973,7 +6023,7 @@ static bool store_qb(vthread_t thr, vvp_code_t cp, unsigned wid=0)
       ELEM value;
       vvp_net_t*net = cp->net;
       unsigned max_size = thr->words[cp->bit_idx[0]].w_int;
-      pop_value(value, thr, wid); // Pop the value to store.
+      pop_value(thr, value, wid); // Pop the value to store.
 
       vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
       assert(queue);
@@ -6012,20 +6062,21 @@ static bool store_qdar(vthread_t thr, vvp_code_t cp, unsigned wid=0)
       ELEM value;
       vvp_net_t*net = cp->net;
       unsigned max_size = thr->words[cp->bit_idx[0]].w_int;
-      pop_value(value, thr, wid); // Pop the value to store.
+      pop_value(thr, value, wid); // Pop the value to store.
 
       vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
       assert(queue);
       if (idx < 0) {
-	    cerr << "Warning: cannot assign to a negative ";
-	    print_queue_type(value);
-	    cerr << " index (" << idx << "). ";
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot assign to a negative "
+	         << get_queue_type(value)
+	         << " index (" << idx << "). ";
 	    print_queue_value(value);
 	    cerr << " was not added." << endl;
       } else if (thr->flags[4] != BIT4_0) {
-	    cerr << "Warning: cannot assign to an undefined ";
-	    print_queue_type(value);
-	    cerr << " index. ";
+	    cerr << thr->get_fileline()
+	         << "Warning: cannot assign to an undefined "
+	         << get_queue_type(value) << " index. ";
 	    print_queue_value(value);
 	    cerr << " was not added." << endl;
       } else
@@ -6034,7 +6085,7 @@ static bool store_qdar(vthread_t thr, vvp_code_t cp, unsigned wid=0)
 }
 
 /*
- * %store/qdar/real <var>, idx
+ * %store/qdar/r <var>, idx
  */
 bool of_STORE_QDAR_R(vthread_t thr, vvp_code_t cp)
 {
@@ -6050,13 +6101,12 @@ bool of_STORE_QDAR_STR(vthread_t thr, vvp_code_t cp)
 }
 
 /*
- * %store/qdar/vec4 <var>, idx
+ * %store/qdar/v <var>, idx
  */
-bool of_STORE_QDAR_VEC4(vthread_t thr, vvp_code_t cp)
+bool of_STORE_QDAR_V(vthread_t thr, vvp_code_t cp)
 {
       return store_qdar<vvp_vector4_t, vvp_queue_vec4>(thr, cp, cp->bit_idx[1]);
 }
-
 
 template <typename ELEM, class QTYPE>
 static bool store_qf(vthread_t thr, vvp_code_t cp, unsigned wid=0)
@@ -6064,7 +6114,7 @@ static bool store_qf(vthread_t thr, vvp_code_t cp, unsigned wid=0)
       ELEM value;
       vvp_net_t*net = cp->net;
       unsigned max_size = thr->words[cp->bit_idx[0]].w_int;
-      pop_value(value, thr, wid); // Pop the value to store.
+      pop_value(thr, value, wid); // Pop the value to store.
 
       vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
       assert(queue);
@@ -6095,12 +6145,75 @@ bool of_STORE_QF_V(vthread_t thr, vvp_code_t cp)
       return store_qf<vvp_vector4_t, vvp_queue_vec4>(thr, cp, cp->bit_idx[1]);
 }
 
-bool of_STORE_REAL(vthread_t thr, vvp_code_t cp)
+template <typename ELEM, class QTYPE>
+static bool store_qobj(vthread_t thr, vvp_code_t cp, unsigned wid=0)
 {
-      double val = thr->pop_real();
+// FIXME: Can we actually use wid here?
+      (void)wid;
+      vvp_net_t*net = cp->net;
+      unsigned max_size = thr->words[cp->bit_idx[0]].w_int;
+
+      vvp_queue*queue = get_queue_object<QTYPE>(thr, net);
+      assert(queue);
+
+      vvp_object_t src;
+      thr->pop_object(src);
+
+      queue->copy_elems(src, max_size);
+      return true;
+}
+
+bool of_STORE_QOBJ_R(vthread_t thr, vvp_code_t cp)
+{
+      return store_qobj<double, vvp_queue_real>(thr, cp);
+}
+
+bool of_STORE_QOBJ_STR(vthread_t thr, vvp_code_t cp)
+{
+      return store_qobj<string, vvp_queue_string>(thr, cp);
+}
+
+bool of_STORE_QOBJ_V(vthread_t thr, vvp_code_t cp)
+{
+      return store_qobj<vvp_vector4_t, vvp_queue_vec4>(thr, cp, cp->bit_idx[1]);
+}
+
+static void vvp_send(vthread_t thr, vvp_net_ptr_t ptr, double&val)
+{
+      vvp_send_real(ptr, val, thr->wt_context);
+}
+
+static void vvp_send(vthread_t thr, vvp_net_ptr_t ptr, string&val)
+{
+      vvp_send_string(ptr, val, thr->wt_context);
+}
+
+template <typename ELEM>
+static bool store(vthread_t thr, vvp_code_t cp)
+{
+      ELEM val;
+      pop_value(thr, val, 0);
 	/* set the value into port 0 of the destination. */
       vvp_net_ptr_t ptr (cp->net, 0);
-      vvp_send_real(ptr, val, thr->wt_context);
+      vvp_send(thr, ptr, val);
+      return true;
+}
+
+bool of_STORE_REAL(vthread_t thr, vvp_code_t cp)
+{
+      return store<double>(thr, cp);
+}
+
+template <typename ELEM>
+static bool storea(vthread_t thr, vvp_code_t cp)
+{
+      unsigned idx = cp->bit_idx[0];
+      unsigned adr = thr->words[idx].w_int;
+      ELEM val;
+      pop_value(thr, val, 0);
+
+      if (thr->flags[4] != BIT4_1)
+	    cp->array->set_word(adr, val);
 
       return true;
 }
@@ -6110,24 +6223,12 @@ bool of_STORE_REAL(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_REALA(vthread_t thr, vvp_code_t cp)
 {
-      unsigned idx = cp->bit_idx[0];
-      unsigned adr = thr->words[idx].w_int;
-
-      double val = thr->pop_real();
-      cp->array->set_word(adr, val);
-
-      return true;
+      return storea<double>(thr, cp);
 }
 
 bool of_STORE_STR(vthread_t thr, vvp_code_t cp)
 {
-	/* set the value into port 0 of the destination. */
-      vvp_net_ptr_t ptr (cp->net, 0);
-
-      string val = thr->pop_str();
-      vvp_send_string(ptr, val, thr->wt_context);
-
-      return true;
+      return store<string>(thr, cp);
 }
 
 /*
@@ -6135,13 +6236,7 @@ bool of_STORE_STR(vthread_t thr, vvp_code_t cp)
  */
 bool of_STORE_STRA(vthread_t thr, vvp_code_t cp)
 {
-      unsigned idx = cp->bit_idx[0];
-      unsigned adr = thr->words[idx].w_int;
-
-      string val = thr->pop_str();
-      cp->array->set_word(adr, val);
-
-      return true;
+      return storea<string>(thr, cp);
 }
 
 /*
@@ -6176,7 +6271,8 @@ bool of_STORE_VEC4(vthread_t thr, vvp_code_t cp)
       unsigned val_size = val.size();
 
       if ((int)val_size < wid) {
-	    cerr << "XXXX Internal error: val.size()=" << val_size
+	    cerr << thr->get_fileline()
+	         << "XXXX Internal error: val.size()=" << val_size
 		 << ", expecting >= " << wid << endl;
       }
       assert((int)val_size >= wid);
@@ -6355,15 +6451,19 @@ bool of_SUBSTR_VEC4(vthread_t thr, vvp_code_t cp)
       return true;
 }
 
-bool of_FILE_LINE(vthread_t, vvp_code_t cp)
+bool of_FILE_LINE(vthread_t thr, vvp_code_t cp)
 {
-      if (show_file_line) {
-	    vpiHandle handle = cp->handle;
-	    cerr << vpi_get_str(vpiFile, handle) << ":"
-	         << vpi_get(vpiLineNo, handle) << ": ";
-	    cerr << vpi_get_str(_vpiDescription, handle);
-	    cerr << endl;
-      }
+      vpiHandle handle = cp->handle;
+
+	/* When it is available, keep the file/line information in the
+	   thread for error/warning messages. */
+      thr->set_fileline(vpi_get_str(vpiFile, handle),
+                        vpi_get(vpiLineNo, handle));
+
+      if (show_file_line)
+	    cerr << thr->get_fileline()
+	         << vpi_get_str(_vpiDescription, handle) << endl;
+
       return true;
 }
 
@@ -6604,8 +6704,6 @@ static bool do_exec_ufunc(vthread_t thr, vvp_code_t cp, vthread_t child)
       child->i_am_in_function = 1;
       vthread_run(child);
       running_thread = thr;
-
-      assert(test_joinable(thr, child));
 
       if (child->i_have_ended) {
 	    do_join(thr, child);

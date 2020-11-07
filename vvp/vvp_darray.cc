@@ -410,6 +410,11 @@ vvp_queue::~vvp_queue()
 {
 }
 
+void vvp_queue::copy_elems(vvp_object_t, unsigned)
+{
+      cerr << "Sorry: copy_elems() not implemented for " << typeid(*this).name() << endl;
+}
+
 void vvp_queue::set_word_max(unsigned, const vvp_vector4_t&, unsigned)
 {
       cerr << "XXXX set_word_max(vvp_vector4_t) not implemented for " << typeid(*this).name() << endl;
@@ -474,13 +479,68 @@ vvp_queue_real::~vvp_queue_real()
 {
 }
 
+/*
+ * Helper functions used while copying multiple elements into a queue.
+ */
+static void print_copy_is_too_big(size_t src_size, unsigned max_size, string qtype)
+{
+      cerr << get_fileline()
+           << "Warning: queue<" << qtype << "> is bounded to have at most "
+           << max_size << " elements, source has " << src_size << " elements." << endl;
+}
+
+static void print_copy_is_too_big(double&, size_t src_size, unsigned max_size)
+{
+      print_copy_is_too_big(src_size, max_size, "real");
+}
+
+static void print_copy_is_too_big(string&, size_t src_size, unsigned max_size)
+{
+      print_copy_is_too_big(src_size, max_size, "string");
+}
+
+static void print_copy_is_too_big(vvp_vector4_t&, size_t src_size, unsigned max_size)
+{
+      print_copy_is_too_big(src_size, max_size, "vector");
+}
+
+template <typename ELEM, class QTYPE, class SRC_TYPE>
+static void copy_elements(QTYPE*queue, SRC_TYPE*src, unsigned max_size)
+{
+      size_t src_size = src->get_size();
+      if ((max_size != 0) && (src_size > max_size)) {
+	    ELEM tmp;
+	    print_copy_is_too_big(tmp, src_size, max_size);
+      }
+      unsigned copy_size = ((src_size < max_size) ||
+                            (max_size == 0)) ? src_size : max_size;
+      if (copy_size < queue->get_size())
+	    queue->erase_tail(copy_size);
+      for (unsigned idx=0; idx < copy_size; ++idx) {
+	    ELEM value;
+	    src->get_word(idx, value);
+	    queue->set_word_max(idx, value, max_size);
+      }
+}
+
+void vvp_queue_real::copy_elems(vvp_object_t src, unsigned max_size)
+{
+      if (vvp_queue*src_queue = src.peek<vvp_queue>())
+	    copy_elements<double, vvp_queue_real, vvp_queue>(this, src_queue, max_size);
+      else if (vvp_darray*src_darray = src.peek<vvp_darray>())
+	    copy_elements<double, vvp_queue_real, vvp_darray>(this, src_darray, max_size);
+      else
+	    cerr << get_fileline() << "Sorry: cannot copy object to real queue." << endl;
+}
+
 void vvp_queue_real::set_word_max(unsigned adr, double value, unsigned max_size)
 {
       if (adr == queue.size())
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: assigning to queue<real>[" << adr << "] is"
+		  cerr << get_fileline()
+		       << "Warning: assigning to queue<real>[" << adr << "] is"
 		          " outside bound (" << max_size << "). " << value
 		       << " was not added." << endl;
       else
@@ -492,7 +552,8 @@ void vvp_queue_real::set_word(unsigned adr, double value)
       if (adr < queue.size())
 	    queue[adr] = value;
       else
-	    cerr << "Warning: assigning to queue<real>[" << adr << "] is outside "
+	    cerr << get_fileline()
+	         << "Warning: assigning to queue<real>[" << adr << "] is outside "
 	            "of size (" << queue.size() << "). " << value
 	         << " was not added." << endl;
 }
@@ -509,7 +570,8 @@ void vvp_queue_real::insert(unsigned idx, double value, unsigned max_size)
 {
 	// Inserting past the end of the queue
       if (idx > queue.size())
-	    cerr << "Warning: inserting to queue<real>[" << idx << "] is "
+	    cerr << get_fileline()
+	         << "Warning: inserting to queue<real>[" << idx << "] is "
 	            "outside of size (" << queue.size() << "). " << value
 	         << " was not added." << endl;
 	// Inserting at the end
@@ -517,12 +579,14 @@ void vvp_queue_real::insert(unsigned idx, double value, unsigned max_size)
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: inserting to queue<real>[" << idx << "] is"
+		  cerr << get_fileline()
+		       << "Warning: inserting to queue<real>[" << idx << "] is"
 		          " outside bound (" << max_size << "). " << value
 		       << " was not added." << endl;
       else  {
 	    if (max_size && (queue.size() == max_size)) {
-		  cerr << "Warning: insert("<< idx << ", " << value << ") removed "
+		  cerr << get_fileline()
+		       << "Warning: insert("<< idx << ", " << value << ") removed "
 		       << queue.back() << " from already full bounded queue<real> ["
 		       << max_size << "]." << endl;
 		  queue.pop_back();
@@ -551,7 +615,8 @@ void vvp_queue_real::push_back(double value, unsigned max_size)
       if (!max_size || (queue.size() < max_size))
 	    queue.push_back(value);
       else
-	    cerr << "Warning: push_back(" << value
+	    cerr << get_fileline()
+	         << "Warning: push_back(" << value
 	         << ") skipped for already full bounded queue<real> ["
 	         << max_size << "]." << endl;
 }
@@ -559,7 +624,8 @@ void vvp_queue_real::push_back(double value, unsigned max_size)
 void vvp_queue_real::push_front(double value, unsigned max_size)
 {
       if (max_size && (queue.size() == max_size)) {
-	    cerr << "Warning: push_front(" << value << ") removed "
+	    cerr << get_fileline()
+	         << "Warning: push_front(" << value << ") removed "
 	         << queue.back() << " from already full bounded queue<real> ["
 	         << max_size << "]." << endl;
 	    queue.pop_back();
@@ -593,13 +659,24 @@ vvp_queue_string::~vvp_queue_string()
 {
 }
 
+void vvp_queue_string::copy_elems(vvp_object_t src, unsigned max_size)
+{
+      if (vvp_queue*src_queue = src.peek<vvp_queue>())
+	    copy_elements<string, vvp_queue_string, vvp_queue>(this, src_queue, max_size);
+      else if (vvp_darray*src_darray = src.peek<vvp_darray>())
+	    copy_elements<string, vvp_queue_string, vvp_darray>(this, src_darray, max_size);
+      else
+	    cerr << get_fileline() << "Sorry: cannot copy object to string queue." << endl;
+}
+
 void vvp_queue_string::set_word_max(unsigned adr, const string&value, unsigned max_size)
 {
       if (adr == queue.size())
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: assigning to queue<string>[" << adr << "] is"
+		  cerr << get_fileline()
+		       << "Warning: assigning to queue<string>[" << adr << "] is"
 		          " outside bound (" << max_size << "). \"" << value
 		       << "\" was not added." << endl;
       else
@@ -611,7 +688,8 @@ void vvp_queue_string::set_word(unsigned adr, const string&value)
       if (adr < queue.size())
 	    queue[adr] = value;
       else
-	    cerr << "Warning: assigning to queue<string>[" << adr << "] is outside "
+	    cerr << get_fileline()
+	         << "Warning: assigning to queue<string>[" << adr << "] is outside "
 	            "of size (" << queue.size() << "). \"" << value
 	         << "\" was not added." << endl;
 }
@@ -628,7 +706,8 @@ void vvp_queue_string::insert(unsigned idx, const string&value, unsigned max_siz
 {
 	// Inserting past the end of the queue
       if (idx > queue.size())
-	    cerr << "Warning: inserting to queue<string>[" << idx << "] is "
+	    cerr << get_fileline()
+	         << "Warning: inserting to queue<string>[" << idx << "] is "
 	            "outside of size (" << queue.size() << "). \"" << value
 	         << "\" was not added." << endl;
 	// Inserting at the end
@@ -636,14 +715,16 @@ void vvp_queue_string::insert(unsigned idx, const string&value, unsigned max_siz
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: inserting to queue<string>[" << idx << "] is"
+		  cerr << get_fileline()
+		       << "Warning: inserting to queue<string>[" << idx << "] is"
 		          " outside bound (" << max_size << "). \"" << value
 		       << "\" was not added." << endl;
       else  {
 	    if (max_size && (queue.size() == max_size)) {
-		  cerr << "Warning: insert("<< idx << ", \"" << value << "\") removed \""
-		  << queue.back() << "\" from already full bounded queue<string> ["
-		  << max_size << "]." << endl;
+		  cerr << get_fileline()
+		       << "Warning: insert("<< idx << ", \"" << value << "\") removed \""
+		       << queue.back() << "\" from already full bounded queue<string> ["
+		       << max_size << "]." << endl;
 		  queue.pop_back();
 	    }
 	      // Inserting at the beginning
@@ -670,7 +751,8 @@ void vvp_queue_string::push_back(const string&value, unsigned max_size)
       if (!max_size || (queue.size() < max_size))
 	    queue.push_back(value);
       else
-	    cerr << "Warning: push_back(\"" << value
+	    cerr << get_fileline()
+	         << "Warning: push_back(\"" << value
 	         << "\") skipped for already full bounded queue<string> ["
 	         << max_size << "]." << endl;
 }
@@ -678,7 +760,8 @@ void vvp_queue_string::push_back(const string&value, unsigned max_size)
 void vvp_queue_string::push_front(const string&value, unsigned max_size)
 {
       if (max_size && (queue.size() == max_size)) {
-	    cerr << "Warning: push_front(\"" << value << "\") removed \""
+	    cerr << get_fileline()
+	         << "Warning: push_front(\"" << value << "\") removed \""
 	         << queue.back() << "\" from already full bounded queue<string> ["
 	         << max_size << "]." << endl;
 	    queue.pop_back();
@@ -712,13 +795,24 @@ vvp_queue_vec4::~vvp_queue_vec4()
 {
 }
 
+void vvp_queue_vec4::copy_elems(vvp_object_t src, unsigned max_size)
+{
+      if (vvp_queue*src_queue = src.peek<vvp_queue>())
+	    copy_elements<vvp_vector4_t, vvp_queue_vec4, vvp_queue>(this, src_queue, max_size);
+      else if (vvp_darray*src_darray = src.peek<vvp_darray>())
+	    copy_elements<vvp_vector4_t, vvp_queue_vec4, vvp_darray>(this, src_darray, max_size);
+      else
+	    cerr << get_fileline() << "Sorry: cannot copy object to vector queue." << endl;
+}
+
 void vvp_queue_vec4::set_word_max(unsigned adr, const vvp_vector4_t&value, unsigned max_size)
 {
       if (adr == queue.size())
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: assigning to queue<vector>[" << adr << "] is"
+		  cerr << get_fileline()
+		       << "Warning: assigning to queue<vector>[" << adr << "] is"
 		          " outside bound (" << max_size << "). " << value
 		       << " was not added." << endl;
       else
@@ -730,7 +824,8 @@ void vvp_queue_vec4::set_word(unsigned adr, const vvp_vector4_t&value)
       if (adr < queue.size())
 	    queue[adr] = value;
       else
-	    cerr << "Warning: assigning to queue<vector>[" << adr << "] is outside "
+	    cerr << get_fileline()
+	         << "Warning: assigning to queue<vector>[" << adr << "] is outside "
 	            "of size (" << queue.size() << "). " << value
 	         << " was not added." << endl;
 }
@@ -747,7 +842,8 @@ void vvp_queue_vec4::insert(unsigned idx, const vvp_vector4_t&value, unsigned ma
 {
 	// Inserting past the end of the queue
       if (idx > queue.size())
-	    cerr << "Warning: inserting to queue<vector[" << value.size()
+	    cerr << get_fileline()
+	         << "Warning: inserting to queue<vector[" << value.size()
 	         << "]>[" << idx << "] is outside of size (" << queue.size()
 	         << "). " << value << " was not added." << endl;
 	// Inserting at the end
@@ -755,12 +851,14 @@ void vvp_queue_vec4::insert(unsigned idx, const vvp_vector4_t&value, unsigned ma
 	    if (!max_size || (queue.size() < max_size))
 		  queue.push_back(value);
 	    else
-		  cerr << "Warning: inserting to queue<vector[" << value.size()
+		  cerr << get_fileline()
+		       << "Warning: inserting to queue<vector[" << value.size()
 		       << "]>[" << idx << "] is outside bound (" << max_size
 		       << "). " << value << " was not added." << endl;
       else  {
 	    if (max_size && (queue.size() == max_size)) {
-		  cerr << "Warning: insert("<< idx << ", " << value << ") removed "
+		  cerr << get_fileline()
+		       << "Warning: insert("<< idx << ", " << value << ") removed "
 		       << queue.back() << " from already full bounded queue<vector["
 		       << value.size() << "]> [" << max_size << "]." << endl;
 		  queue.pop_back();
@@ -789,7 +887,8 @@ void vvp_queue_vec4::push_back(const vvp_vector4_t&value, unsigned max_size)
       if (!max_size || (queue.size() < max_size))
 	    queue.push_back(value);
       else
-	    cerr << "Warning: push_back(" << value
+	    cerr << get_fileline()
+	         << "Warning: push_back(" << value
 	         << ") skipped for already full bounded queue<vector["
 	         << value.size() << "]> [" << max_size << "]." << endl;
 }
@@ -797,7 +896,8 @@ void vvp_queue_vec4::push_back(const vvp_vector4_t&value, unsigned max_size)
 void vvp_queue_vec4::push_front(const vvp_vector4_t&value, unsigned max_size)
 {
       if (max_size && (queue.size() == max_size)) {
-	    cerr << "Warning: push_front(" << value << ") removed "
+	    cerr << get_fileline()
+	         << "Warning: push_front(" << value << ") removed "
 	         << queue.back() << " from already full bounded queue<vector["
 	         << value.size() << "]> [" << max_size << "]." << endl;
 	    queue.pop_back();

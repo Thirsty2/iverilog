@@ -153,28 +153,17 @@ static void ifdef_leave(void)
         size_t rc = fread(buf, 1, max_size, istack->file);              \
         result = (rc == 0) ? YY_NULL : rc;                              \
     } else {                                                            \
-        /* We are expanding a macro. Handle the SV macro escape         \
-           sequences. There doesn't seem to be any good reason          \
-           not to allow them in traditional Verilog as well. */         \
-        while ((istack->str[0] == '`') &&                               \
-               (istack->str[1] == '`')) {                               \
-            istack->str += 2;                                           \
+        /* We are expanding a macro. Handle the SV `` delimiter.        \
+           If the delimiter terminates a defined macro usage, leave     \
+           it in place, otherwise remove it now. */                     \
+        if (!(yytext[0] == '`' && is_defined(yytext+1))) {              \
+            while ((istack->str[0] == '`') &&                           \
+                   (istack->str[1] == '`')) {                           \
+                istack->str += 2;                                       \
+            }                                                           \
         }                                                               \
         if (*istack->str == 0) {                                        \
             result = YY_NULL;                                           \
-        } else if ((istack->str[0] == '`') &&                           \
-                   (istack->str[1] == '"')) {                           \
-            istack->str += 2;                                           \
-            buf[0] = '"';                                               \
-            result = 1;                                                 \
-        } else if ((istack->str[0] == '`') &&                           \
-                   (istack->str[1] == '\\')&&                           \
-                   (istack->str[2] == '`') &&                           \
-                   (istack->str[3] == '"')) {                           \
-            istack->str += 4;                                           \
-            buf[0] = '\\';                                              \
-            buf[1] = '"';                                               \
-            result = 2;                                                 \
         } else {                                                        \
             buf[0] = *istack->str++;                                    \
             result = 1;                                                 \
@@ -185,21 +174,23 @@ static void ifdef_leave(void)
 static int comment_enter = 0;
 static int pragma_enter = 0;
 static int string_enter = 0;
+static int prev_state = 0;
 
 static int ma_parenthesis_level = 0;
 %}
 
 %option stack
-%option nounput
 %option noinput
 %option noyy_top_state
 %option noyywrap
 
 %x PPINCLUDE
 %x DEF_NAME
+%x DEF_ESC
 %x DEF_ARG
 %x DEF_SEP
 %x DEF_TXT
+%x MN_ESC
 %x MA_START
 %x MA_ADD
 %x CCOMMENT
@@ -207,6 +198,11 @@ static int ma_parenthesis_level = 0;
 %x PCOMENT
 %x CSTRING
 %x ERROR_LINE
+
+%x IFDEF_NAME
+%x IFNDEF_NAME
+%x ELSIF_NAME
+%x ELSIF_SUPR
 
 %x IFDEF_FALSE
 %s IFDEF_TRUE
@@ -262,9 +258,7 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
     if (macro_needs_args(yytext+1)) yy_push_state(MA_START); else do_expand(0);
 }
 
- /* Strings do not contain preprocessor directives, but can expand
-  * macros. If that happens, they get expanded in the context of the
-  * string.
+ /* Strings do not contain preprocessor directives or macro expansions.
   */
 \"            { string_enter = YY_START; BEGIN(CSTRING); ECHO; }
 <CSTRING>\\\\ |
@@ -346,6 +340,11 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
 <DEF_NAME>[a-zA-Z_][a-zA-Z0-9_$]*"("{W}? { BEGIN(DEF_ARG); def_start(); }
 <DEF_NAME>[a-zA-Z_][a-zA-Z0-9_$]*{W}?    { BEGIN(DEF_TXT); def_start(); }
 
+<DEF_NAME>\\ { BEGIN(DEF_ESC); }
+
+<DEF_ESC>[^ \t\b\f\n\r]+{W}"("{W}? { BEGIN(DEF_ARG); def_start(); }
+<DEF_ESC>[^ \t\b\f\n\r]+{W}        { BEGIN(DEF_TXT); def_start(); }
+
   /* define arg: <name> = <text> */
 <DEF_ARG>[a-zA-Z_][a-zA-Z0-9_$]*{W}*"="[^,\)]*{W}? { BEGIN(DEF_SEP); def_add_arg(); }
   /* define arg: <name> */
@@ -360,7 +359,7 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
 
 <DEF_ARG,DEF_SEP>(\n|"\r\n"|"\n\r"|\r){W}? { istack->lineno += 1; fputc('\n', yyout); }
 
-<DEF_NAME,DEF_ARG,DEF_SEP>. {
+<DEF_NAME,DEF_ESC,DEF_ARG,DEF_SEP>. {
     emit_pathline(istack);
     fprintf(stderr, "error: malformed `define directive.\n");
     error_count += 1;
@@ -407,56 +406,51 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
    * condition that stacks on top of the IFDEF_FALSE so that output is
    * not accidentally turned on within nested ifdefs.
    */
-`ifdef{W}[a-zA-Z_][a-zA-Z0-9_$]* {
-    char* name = strchr(yytext, '`'); assert(name);
-
-    name += 6;
-    name += strspn(name, " \t\b\f");
-
+`ifdef{W} {
     ifdef_enter();
-
-    if (is_defined(name))
-        yy_push_state(IFDEF_TRUE);
-    else
-        yy_push_state(IFDEF_FALSE);
+    yy_push_state(IFDEF_NAME);
 }
 
-`ifndef{W}[a-zA-Z_][a-zA-Z0-9_$]* {
-    char* name = strchr(yytext, '`'); assert(name);
-
-    name += 7;
-    name += strspn(name, " \t\b\f");
-
+`ifndef{W} {
     ifdef_enter();
-
-    if (!is_defined(name))
-        yy_push_state(IFDEF_TRUE);
-    else
-        yy_push_state(IFDEF_FALSE);
+    yy_push_state(IFNDEF_NAME);
 }
 
 <IFDEF_FALSE,IFDEF_SUPR>`ifdef{W}  |
 <IFDEF_FALSE,IFDEF_SUPR>`ifndef{W} { ifdef_enter(); yy_push_state(IFDEF_SUPR); }
 
-<IFDEF_TRUE>`elsif{W}[a-zA-Z_][a-zA-Z0-9_$]* { BEGIN(IFDEF_SUPR); }
+<IFDEF_TRUE>`elsif{W}  { prev_state = YYSTATE; BEGIN(ELSIF_SUPR); }
+<IFDEF_FALSE>`elsif{W} { prev_state = YYSTATE; BEGIN(ELSIF_NAME); }
+<IFDEF_SUPR>`elsif{W}  { prev_state = YYSTATE; BEGIN(ELSIF_SUPR); }
 
-<IFDEF_FALSE>`elsif{W}[a-zA-Z_][a-zA-Z0-9_$]* {
-    char* name = strchr(yytext, '`'); assert(name);
+<IFDEF_TRUE>`else  { BEGIN(IFDEF_SUPR); }
+<IFDEF_FALSE>`else { BEGIN(IFDEF_TRUE); }
+<IFDEF_SUPR>`else  {}
 
-    name += 6;
-    name += strspn(name, " \t\b\f");
-
-    if (is_defined(name))
+<IFDEF_NAME>[a-zA-Z_][a-zA-Z0-9_$]* {
+    if (is_defined(yytext))
         BEGIN(IFDEF_TRUE);
     else
         BEGIN(IFDEF_FALSE);
 }
 
-<IFDEF_SUPR>`elsif{W}[a-zA-Z_][a-zA-Z0-9_$]* {  }
+<IFNDEF_NAME>[a-zA-Z_][a-zA-Z0-9_$]* {
+    if (!is_defined(yytext))
+        BEGIN(IFDEF_TRUE);
+    else
+        BEGIN(IFDEF_FALSE);
+}
 
-<IFDEF_TRUE>`else  { BEGIN(IFDEF_SUPR); }
-<IFDEF_FALSE>`else { BEGIN(IFDEF_TRUE); }
-<IFDEF_SUPR>`else  {}
+<ELSIF_NAME>[a-zA-Z_][a-zA-Z0-9_$]* {
+    if (is_defined(yytext))
+        BEGIN(IFDEF_TRUE);
+    else
+        BEGIN(IFDEF_FALSE);
+}
+
+<ELSIF_SUPR>[a-zA-Z_][a-zA-Z0-9_$]* {
+    BEGIN(IFDEF_SUPR);
+}
 
 <IFDEF_FALSE,IFDEF_SUPR>"//"[^\r\n]* {}
 
@@ -477,25 +471,45 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
 
 <IFDEF_FALSE,IFDEF_TRUE,IFDEF_SUPR>`endif { ifdef_leave(); yy_pop_state(); }
 
+<IFDEF_NAME>(\n|\r) |
+<IFDEF_NAME>. |
 `ifdef {
     error_count += 1;
     fprintf(stderr, "%s:%u: `ifdef without a macro name - ignored.\n",
             istack->path, istack->lineno+1);
+    if (YY_START == IFDEF_NAME) {
+        ifdef_leave();
+        yy_pop_state();
+        unput(yytext[0]);
+    }
 }
 
+<IFNDEF_NAME>(\n|\r) |
+<IFNDEF_NAME>. |
 `ifndef {
     error_count += 1;
     fprintf(stderr, "%s:%u: `ifndef without a macro name - ignored.\n",
             istack->path, istack->lineno+1);
+    if (YY_START == IFNDEF_NAME) {
+        ifdef_leave();
+        yy_pop_state();
+        unput(yytext[0]);
+    }
 }
 
+<ELSIF_NAME,ELSIF_SUPR>(\n|\r) |
+<ELSIF_NAME,ELSIF_SUPR>. |
 `elsif {
     error_count += 1;
     fprintf(stderr, "%s:%u: `elsif without a macro name - ignored.\n",
             istack->path, istack->lineno+1);
+    if (YY_START != INITIAL) {
+        BEGIN(prev_state);
+        unput(yytext[0]);
+    }
 }
 
-`elsif{W}[a-zA-Z_][a-zA-Z0-9_$]* {
+<INITIAL>`elsif{W}[a-zA-Z_][a-zA-Z0-9_$]* {
     error_count += 1;
     fprintf(stderr, "%s:%u: `elsif without a matching `ifdef - ignored.\n",
             istack->path, istack->lineno+1);
@@ -528,18 +542,53 @@ keywords (include|define|undef|ifdef|ifndef|else|elseif|endif)
         do_expand(0);
 }
 
-  /* Stringified version of macro expansion. This is an Icarus extension.
-     When expanding macro text, the SV usage of `` takes precedence. */
-``[a-zA-Z_][a-zA-Z0-9_$]* {
-    assert(istack->file);
-    assert(do_expand_stringify_flag == 0);
-    do_expand_stringify_flag = 1;
-    fputc('"', yyout);
-    if (macro_needs_args(yytext+2))
+`\\ { yy_push_state(MN_ESC); }
+
+<MN_ESC>[^ \t\b\f\n\r]+ {
+    yy_pop_state();
+    if (macro_needs_args(yytext))
         yy_push_state(MA_START);
     else
         do_expand(0);
 }
+
+<MN_ESC>. {
+    yy_pop_state();
+    unput(yytext[0]);
+    emit_pathline(istack);
+    fprintf(stderr, "error: malformed macro name.\n");
+    error_count += 1;
+}
+
+  /* Stringified version of macro expansion. This is an Icarus extension.
+     When expanding macro text, the SV usage of `` takes precedence. */
+``[a-zA-Z_][a-zA-Z0-9_$]* {
+    if (istack->file) {
+        assert(do_expand_stringify_flag == 0);
+        do_expand_stringify_flag = 1;
+        fputc('"', yyout);
+        if (macro_needs_args(yytext+2))
+            yy_push_state(MA_START);
+        else
+            do_expand(0);
+    } else {
+        REJECT;
+    }
+}
+
+  /* If we are expanding a macro, remove the SV `` delimiter, otherwise
+   * leave it to be handled by the normal rules.
+   */
+`` { if (istack->file) REJECT; }
+
+  /* If we are expanding a macro, handle the SV `" override. This avoids
+   * entering CSTRING state, thus allowing nested macro expansions.
+   */
+`\" { if (!istack->file) fputc('"', yyout); else REJECT; }
+
+  /* If we are expanding a macro, handle the SV `\`" escape sequence.
+   */
+`\\`\" { if (!istack->file) fputs("\\\"", yyout); else REJECT; }
 
 <MA_START>\(  { BEGIN(MA_ADD); macro_start_args(); }
 
@@ -801,8 +850,13 @@ static void def_add_arg(void)
 
       /* This can happen because we are also processing "argv[0]", the
 	 macro name, as a pseudo-argument. The lexor will match that
-	 as name(, so chop off the ( here. */
-    if (yytext[length -  1] == '(') length--;
+	 as name(, so chop off the ( here. If we have an escaped name,
+	 we also need to strip off the white space that terminates the
+	 name. */
+    if (yytext[length -  1] == '(') {
+	length--;
+	while (isspace((int)yytext[length - 1])) length--;
+    }
 
     yytext[length] = 0;
 
