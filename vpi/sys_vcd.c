@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999-2020 Stephen Williams (steve@icarus.com)
+ * Copyright (c) 1999-2021 Stephen Williams (steve@icarus.com)
  *
  *    This source code is free software; you can redistribute it
  *    and/or modify it in source code form under the terms of the GNU
@@ -410,6 +410,7 @@ static void open_dumpfile(vpiHandle callh)
 	    vpi_printf("VCD Error: %s:%d: ", vpi_get_str(vpiFile, callh),
 	               (int)vpi_get(vpiLineNo, callh));
 	    vpi_printf("Unable to open %s for output.\n", dump_path);
+	    vpip_set_return_value(1);
 	    vpi_control(vpiFinish, 1);
 	    free(dump_path);
 	    dump_path = 0;
@@ -804,10 +805,10 @@ static PLI_INT32 sys_dumpvars_calltf(ICARUS_VPI_CONST PLI_BYTE8*name)
       }
       if (!depth) depth = 10000;
 
-        /* This dumps all the modules in the design if none are given. */
+        /* This dumps all the instances in the design if none are given. */
       if (!argv || !(item = vpi_scan(argv))) {
-	    argv = vpi_iterate(vpiModule, 0x0);
-	    assert(argv);  /* There must be at least one top level module. */
+	    argv = vpi_iterate(vpiInstance, 0x0);
+	    assert(argv);  /* There must be at least one top level instance. */
 	    item = vpi_scan(argv);
       }
 

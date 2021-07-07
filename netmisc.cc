@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2020 Stephen Williams (steve@icarus.com)
+ * Copyright (c) 2001-2021 Stephen Williams (steve@icarus.com)
  *
  *    This source code is free software; you can redistribute it
  *    and/or modify it in source code form under the terms of the GNU
@@ -543,7 +543,7 @@ void indices_to_expressions(Design*des, NetScope*scope,
 	    }
 	    ivl_assert(*loc, cur->msb);
 
-	    NetExpr*word_index = elab_and_eval_lossless(des, scope, cur->msb, -2, need_const);
+	    NetExpr*word_index = elab_and_eval(des, scope, cur->msb, -1, need_const);
 
 	    if (word_index == 0)
 		  flags.invalid = true;
@@ -844,30 +844,22 @@ NetExpr* condition_reduce(NetExpr*expr)
       return cmp;
 }
 
-static NetExpr* do_elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
-				 int context_width, bool need_const,
-				 bool annotatable, bool force_expand,
-				 ivl_variable_type_t cast_type,
-				 bool force_unsigned)
+NetExpr* elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
+		       int context_width, bool need_const, bool annotatable,
+		       ivl_variable_type_t cast_type, bool force_unsigned)
 {
       PExpr::width_mode_t mode = PExpr::SIZED;
       if ((context_width == -2) && !gn_strict_expr_width_flag)
             mode = PExpr::EXPAND;
-      if (force_expand)
-	    mode = PExpr::EXPAND;
 
       pe->test_width(des, scope, mode);
 
-	// FIXME: A class variable/array inside a class is not
-	//        reported correctly so this cannot be used.
-#if 0
       if (pe->expr_type() == IVL_VT_CLASS) {
 	    cerr << pe->get_fileline() << ": Error: "
 	         << "Class/null r-value not allowed in this context." << endl;
 	    des->errors += 1;
 	    return 0;
       }
-#endif
 
         // Get the final expression width. If the expression is unsized,
         // this may be different from the value returned by test_width().
@@ -891,7 +883,6 @@ static NetExpr* do_elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
                  << "returns type=" << pe->expr_type()
 		 << ", context_width=" << context_width
                  << ", signed=" << pe->has_sign()
-		 << ", force_expand=" << force_expand
                  << ", expr_width=" << expr_width
                  << ", mode=" << PExpr::width_mode_name(mode) << endl;
 	    cerr << pe->get_fileline() << ":              : "
@@ -964,13 +955,6 @@ static NetExpr* do_elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
             }
       }
 
-	// If the context_width sent is is actually the minimum width,
-	// then raise the context_width to be big enough for the
-	// lossless expression.
-      if (force_expand && context_width > 0) {
-	    context_width = max(context_width, (int)expr_width);
-      }
-
       eval_expr(tmp, context_width);
 
       if (NetEConst*ce = dynamic_cast<NetEConst*>(tmp)) {
@@ -979,29 +963,6 @@ static NetExpr* do_elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
       }
 
       return tmp;
-}
-
-NetExpr* elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
-		       int context_width, bool need_const, bool annotatable,
-		       ivl_variable_type_t cast_type, bool force_unsigned)
-{
-      return do_elab_and_eval(des, scope, pe, context_width,
-			      need_const, annotatable, false,
-			      cast_type, force_unsigned);
-}
-
-/*
- * This variant of elab_and_eval does the expression losslessly, no
- * matter what the generation of Verilog. This is in support of
- * certain special contexts, notably index expressions.
- */
-NetExpr* elab_and_eval_lossless(Design*des, NetScope*scope, PExpr*pe,
-				 int context_width, bool need_const, bool annotatable,
-				 ivl_variable_type_t cast_type)
-{
-      return do_elab_and_eval(des, scope, pe, context_width,
-			      need_const, annotatable, true,
-			      cast_type, false);
 }
 
 NetExpr* elab_and_eval(Design*des, NetScope*scope, PExpr*pe,
